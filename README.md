@@ -69,7 +69,7 @@ GitHub Actions watchdog (30 phút/lần) ───┘
 | GitHub repo | `richardnguyen1991/Luan-Van-Lightgbm-Parquet-Github-v3-colab` (public) |
 | S3 bucket | `my-thesis-checkpoints` |
 | S3 prefix | `Luan-Van-Lightgbm-Parquet-Github-v3-colab` |
-| IAM user | `thesis-colab-lightgbm`, policy giới hạn đúng prefix trên |
+| IAM user | `kaggle-checkpoint` (dùng lại từ pipeline Kaggle v2) — policy phải cho phép prefix `Luan-Van-Lightgbm-Parquet-Github-v3-colab/` |
 
 Sửa `repository` trong `config/orchestration.json` nếu bạn dùng tên repo khác, rồi chạy lại
 `python scripts/build_colab_notebook.py` để badge "Open in Colab" trỏ đúng chỗ.
@@ -83,8 +83,16 @@ Sửa `repository` trong `config/orchestration.json` nếu bạn dùng tên repo
 năm secret trên, cộng `KAGGLE_USERNAME` và `KAGGLE_KEY` — hai cái này chỉ cần cho lần tiền
 xử lý đầu tiên, khi phải tải Parquet gốc về.
 
-**AWS IAM**: một user riêng, policy chỉ cho `s3:GetObject/PutObject/DeleteObject/ListBucket`
-trên `arn:aws:s3:::my-thesis-checkpoints/Luan-Van-Lightgbm-Parquet-Github-v3-colab/*`.
+**AWS IAM**: user `kaggle-checkpoint` dùng chung với pipeline Kaggle v2, cần
+`s3:GetObject/PutObject/DeleteObject` trên
+`arn:aws:s3:::my-thesis-checkpoints/Luan-Van-Lightgbm-Parquet-Github-v3-colab/*` và
+`s3:ListBucket` trên chính bucket.
+
+Không có dòng code nào biết tên IAM user — pipeline chỉ đọc access key, secret, region, bucket
+và prefix. Đổi user chỉ là đổi giá trị secret. **Điều duy nhất phải kiểm** là policy của user
+đó có phủ prefix `v3-colab` hay không: nếu nó được viết cho prefix `v2` thì mọi thao tác S3 sẽ
+chết với `AccessDenied` ngay ở lần ghi checkpoint đầu tiên. Xem *Kiểm tra quyền S3 trước khi
+train* ở cuối README.
 
 Repo là public nhưng notebook **không** chứa khoá: nó đọc qua
 `google.colab.userdata.get()`, tức secret nằm trong tài khoản Colab của bạn. Test
@@ -394,6 +402,41 @@ lượng và peak RSS.
 8. `feature_selection.json` có `fit_split = "train"` và `ranking_by_gain` phủ hết cột ứng
    viên — chứng minh việc chọn cột không chạm vào validation/test.
 9. Repo public không chứa `AKIA` hay secret trong `.ipynb`.
+
+## Kiểm tra quyền S3 trước khi train
+
+Sai policy IAM chỉ lộ ra khi pipeline ghi checkpoint đầu tiên — tức sau khi đã tiền xử lý xong
+và tốn hàng giờ. Đoạn dưới kiểm đúng bốn quyền pipeline cần, trên đúng prefix, trong vài giây.
+Dán vào một cell mới trong Colab, **chạy sau cell 2** (cell nạp secret):
+
+```python
+import os, boto3
+from botocore.exceptions import ClientError
+
+s3 = boto3.client("s3", region_name=os.environ["AWS_DEFAULT_REGION"])
+bucket, prefix = os.environ["S3_BUCKET"], os.environ["S3_PREFIX"].rstrip("/")
+key = f"{prefix}/.permission_probe"
+
+def check(name, fn):
+    try:
+        fn(); print(f"  OK      {name}")
+    except ClientError as exc:
+        print(f"  DENIED  {name}: {exc.response['Error']['Code']}")
+
+print(f"s3://{bucket}/{prefix}")
+check("ListBucket", lambda: s3.list_objects_v2(Bucket=bucket, Prefix=prefix + "/", MaxKeys=1))
+check("PutObject",  lambda: s3.put_object(Bucket=bucket, Key=key, Body=b"probe"))
+check("GetObject",  lambda: s3.get_object(Bucket=bucket, Key=key))
+check("DeleteObject", lambda: s3.delete_object(Bucket=bucket, Key=key))
+```
+
+Bốn dòng `OK` nghĩa là đường S3 thông. Bất kỳ `DENIED` nào cũng phải sửa policy trước khi
+chạy tiếp — `AccessDenied` ở `PutObject` là dấu hiệu kinh điển của policy viết cho prefix của
+một project cũ.
+
+Chạy được ở Colab hoặc GitHub Actions. Trên máy Windows có antivirus quét HTTPS (AVG, Avast,
+Kaspersky…) thì boto3 có thể chết ở khâu bắt tay TLS với `CERTIFICATE_VERIFY_FAILED` — đó là
+lỗi của antivirus, không phải của credentials.
 
 ## Diễn giải feature importance
 
