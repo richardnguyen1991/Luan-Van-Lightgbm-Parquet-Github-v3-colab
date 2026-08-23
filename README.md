@@ -16,9 +16,9 @@ từ boosting iteration kế tiếp.
 - Không early stopping, không tuning, không chọn vòng tốt nhất.
 - Không xử lý mất cân bằng: không class/sample weight, không oversampling/undersampling.
 - Toàn bộ train split dùng ở cả 100 vòng; validation chỉ theo dõi, test chỉ đánh giá một lần.
-- `feature_selection = "train_gain_top_k"`: giữ 20 thuộc tính có gain cao nhất, chọn **chỉ từ
-  train split** bằng một model sàng lọc riêng biệt (xem *Chọn thuộc tính theo gain*). Đây là
-  ràng buộc RAM, không phải tuning: không hyperparameter nào của model chính bị đụng tới.
+- `feature_selection = "none"`: **dùng toàn bộ 81 thuộc tính**, không loại cột nào. Cơ chế
+  sàng lọc theo gain vẫn còn trong mã nguồn như một van xả RAM, nhưng mặc định tắt (xem
+  *Chọn thuộc tính theo gain*).
 - CPU bắt buộc, seed cố định, `deterministic=true`, `force_col_wise=true`.
 - Checkpoint mỗi 10 vòng: Booster `.txt` + `training_state.json` + `history.json` append-only.
 - Model cuối luôn là `final_model_round_100.txt`.
@@ -205,7 +205,16 @@ tại. Con số quyết định run có sống sót hay không là thứ khác:
 thì `train.py` **thoát 75 (dừng an toàn)** chứ không để bị OOM-kill giữa iteration — checkpoint
 S3 còn nguyên, watchdog thử lại trên worker lớn hơn.
 
-## Chọn thuộc tính theo gain: cắt cột nào, và vì sao điều đó không phá baseline
+## Chọn thuộc tính theo gain (mặc định TẮT)
+
+> **Trạng thái hiện tại:** `feature_selection = "none"` trong cả hai profile — baseline chạy
+> với đủ 81 thuộc tính. Trên Colab Pro High-RAM, 81 cột cho đỉnh RAM dự phóng 25,7 GiB so với
+> ngân sách 38,4 GiB, nên van xả này không cần dùng tới. Mục dưới đây mô tả cơ chế để bạn bật
+> lại khi chạy trên máy nhỏ hơn — và để giải thích vì sao nó từng tồn tại.
+>
+> Giữ đủ 81 cột còn là điều kiện để so sánh công bằng với các model khác trong luận văn
+> (GNN, GRU, MLP, Transformer, LSTM): khác tập đặc trưng thì chênh lệch kết quả không còn quy
+> được cho model nữa.
 
 Bảng RAM ở trên có `features` nằm thẳng trong số hạng lớn nhất — `(train + val) × features ×
 1 byte` cho dataset đã binning. Ở quy mô đầy đủ, giữ toàn bộ cột số của CIC-DDoS2019 đẩy con
@@ -424,11 +433,11 @@ lượng và peak RSS.
 6. `sample_manifest.json` → `leakage_audit` có `method =
    exact_intersection_on_deterministic_identity_subsample`, ba giao điểm bằng 0, và
    `sample_identities_tracked_distinct > 0` (chứng minh audit thực sự đã đọc dữ liệu).
-7. Tên và thứ tự thuộc tính của Booster khớp tuyệt đối danh sách
-   `selected_features_in_model_order` trong `config/feature_selection.json`, và danh sách đó
-   là tập con đúng thứ tự của `preprocessing.json`.
-8. `feature_selection.json` có `fit_split = "train"` và `ranking_by_gain` phủ hết cột ứng
-   viên — chứng minh việc chọn cột không chạm vào validation/test.
+7. Tên và thứ tự thuộc tính của Booster khớp tuyệt đối `preprocessing.json`.
+8. `config/feature_selection.json` có `method = "none"` và
+   `selected_feature_count == candidate_feature_count` — chứng minh không cột nào bị loại.
+   (Nếu bật lại sàng lọc: `fit_split = "train"` và `ranking_by_gain` phủ hết cột ứng viên,
+   chứng minh việc chọn cột không chạm vào validation/test.)
 9. Repo public không chứa `AKIA` hay secret trong `.ipynb`.
 
 ## Kiểm tra quyền S3 trước khi train
