@@ -459,6 +459,37 @@ Bốn dòng `OK` nghĩa là đường S3 thông. Bất kỳ `DENIED` nào cũng 
 chạy tiếp — `AccessDenied` ở `PutObject` là dấu hiệu kinh điển của policy viết cho prefix của
 một project cũ.
 
+### Thiếu `DeleteObject` thì sao?
+
+Pipeline **vẫn chạy đúng**. Cả hai chỗ gọi `delete_object` (`checkpoint.py`, `make_report.py`)
+đều nằm trong `finally` và được bọc `try/except` chỉ ghi cảnh báo — chúng dọn key tạm sau khi
+đã `copy_object` sang key cuối và xác minh checksum xong. Mất quyền xoá không làm hỏng artifact
+nào.
+
+Cái giá là rác tích luỹ. Key tạm có dạng `<key>.tmp-<uuid4>`, **uuid mới cho mỗi lần upload**,
+nên chúng không đè lên nhau: mỗi lần ghi để lại vĩnh viễn một bản sao mồ côi. Một run đầy đủ
+của v2 nặng khoảng 1,9 GiB / 306 object, nên thiếu quyền xoá sẽ đẩy nó lên xấp xỉ gấp đôi.
+
+Điều đó không chỉ tốn tiền lưu trữ. `make_report.py --run-dir s3://...` tải **mọi** object dưới
+run prefix về trước khi dựng lại báo cáo, kể cả orphan — nên fallback `mode=report` trên runner
+GitHub (đĩa ~14 GB) phải tải gấp đôi dữ liệu cần thiết.
+
+Vì vậy: không bắt buộc, nhưng nên cấp. Chỉ cần thêm một statement, không đụng policy sẵn có:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowDeleteInsideV3ColabPrefix",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::my-thesis-checkpoints/Luan-Van-Lightgbm-Parquet-Github-v3-colab/*"
+    }
+  ]
+}
+```
+
 Chạy được ở Colab hoặc GitHub Actions. Trên máy Windows có antivirus quét HTTPS (AVG, Avast,
 Kaspersky…) thì boto3 có thể chết ở khâu bắt tay TLS với `CERTIFICATE_VERIFY_FAILED` — đó là
 lỗi của antivirus, không phải của credentials.
