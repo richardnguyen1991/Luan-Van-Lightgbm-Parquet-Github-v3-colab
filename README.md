@@ -258,6 +258,33 @@ là *đủ tốt để training vừa RAM*, **không** phải "20 thuộc tính 
 DDoS". Muốn nói về importance thì dùng bốn thước đo ở mục cuối, và nhớ rằng chúng chỉ xếp
 hạng trong phạm vi 20 cột đã lọt vào model.
 
+### Trên bộ đầy đủ, giảm `maximum_features` gần như không giúp gì
+
+Thông báo lỗi của `require_safe_memory_profile` gợi ý hạ
+`dataset.feature_screening.maximum_features`. Với CIC-DDoS2019 đầy đủ (49,3 triệu dòng train,
+10,6 triệu validation, **19 lớp**), lời khuyên đó gần như không có tác dụng — số liệu tính từ
+chính `model.estimate_training_memory`:
+
+| `maximum_features` | Đỉnh RAM dự phóng |
+|---|---|
+| 20 | 22,3 GiB |
+| 15 | 22,0 GiB |
+| 10 | 21,7 GiB |
+| 8 | 21,6 GiB |
+
+Cắt hơn một nửa số cột chỉ tiết kiệm 0,7 GiB. Lý do nằm ở bảng công thức phía trên: khoản phụ
+thuộc `features` là dataset đã binning, `(train + val) × features × 1 byte` — chỉ 1,2 GiB ở
+mức 20 cột. Mọi khoản còn lại tỉ lệ với **số lớp**, không phải số cột, và 19 lớp × 60 triệu
+dòng mới là thứ chiếm chỗ: riêng buffer dự đoán float64 đã là 9,1 GiB.
+
+Nói cách khác, cần gạt duy nhất có tác dụng là **RAM của máy**. Colab tiêu chuẩn (12,7 GB) cho
+ngân sách 9,5 GiB — không đủ ở bất kỳ số cột nào. Colab Pro **High-RAM** (~51 GB) cho ngân sách
+38,4 GiB, thừa sức chứa 22,3 GiB. Bật High-RAM là điều kiện bắt buộc, không phải tuỳ chọn.
+
+`session.minimum_available_ram_gb = 16.0` chặn trước cả bước này: trên runtime tiêu chuẩn
+`train.py` thoát 75 ngay trước `claim_run`, nên **không** có `active_run.json` nào được tạo —
+dấu hiệu nhận biết là notebook in "No active run pointer was created in this session".
+
 ## Watchdog và fallback
 
 `.github/workflows/watchdog.yml` chạy mỗi 30 phút, đọc `active_run.json` trên S3 và chọn một
