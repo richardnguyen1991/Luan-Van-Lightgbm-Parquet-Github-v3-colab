@@ -408,11 +408,35 @@ lượng và peak RSS.
 
 Sai policy IAM chỉ lộ ra khi pipeline ghi checkpoint đầu tiên — tức sau khi đã tiền xử lý xong
 và tốn hàng giờ. Đoạn dưới kiểm đúng bốn quyền pipeline cần, trên đúng prefix, trong vài giây.
-Dán vào một cell mới trong Colab, **chạy sau cell 2** (cell nạp secret):
+Nó **tự nạp secret** từ Colab Secrets nên dán vào cell mới nào cũng chạy được, không cần chạy
+cell nào trước. Thiếu secret thì nó nói thẳng tên secret đó thay vì báo `KeyError`:
 
 ```python
 import os, boto3
 from botocore.exceptions import ClientError
+
+try:
+    from google.colab import userdata          # tự nạp secret, không phụ thuộc cell 2
+except ImportError:
+    userdata = None
+
+NEEDED = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION",
+          "S3_BUCKET", "S3_PREFIX"]
+missing = []
+for name in NEEDED:
+    value = os.environ.get(name, "").strip()
+    if not value and userdata is not None:
+        try:
+            value = (userdata.get(name) or "").strip()
+        except Exception:
+            value = ""
+    if value:
+        os.environ[name] = value
+    else:
+        missing.append(name)
+if missing:
+    raise SystemExit(
+        "Thiếu secret (hoặc chưa bật Notebook access): " + ", ".join(missing))
 
 s3 = boto3.client("s3", region_name=os.environ["AWS_DEFAULT_REGION"])
 bucket, prefix = os.environ["S3_BUCKET"], os.environ["S3_PREFIX"].rstrip("/")
@@ -424,7 +448,7 @@ def check(name, fn):
     except ClientError as exc:
         print(f"  DENIED  {name}: {exc.response['Error']['Code']}")
 
-print(f"s3://{bucket}/{prefix}")
+print(f"s3://{bucket}/{prefix}  (region {os.environ['AWS_DEFAULT_REGION']})")
 check("ListBucket", lambda: s3.list_objects_v2(Bucket=bucket, Prefix=prefix + "/", MaxKeys=1))
 check("PutObject",  lambda: s3.put_object(Bucket=bucket, Key=key, Body=b"probe"))
 check("GetObject",  lambda: s3.get_object(Bucket=bucket, Key=key))
