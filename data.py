@@ -1,0 +1,1363 @@
+"""Prepare leakage-safe CIC-DDoS2019 Parquet splits for LightGBM.
+
+The split is assigned before feature conversion or LightGBM Dataset creation.
+Rows are never balanced, weighted, or normalized.  Production can use an exact,
+deterministic proportional sample before splitting.  Large inputs are processed
+one Parquet row group at a time and written as split-specific parts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import hashlib
+import json
+import math
+import os
+import platform
+import re
+import sqlite3
+import struct
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import psutil
+
+
+SPLIT_NAMES = ("train", "validation", "test")
+MASK64 = np.uint64(0xFFFFFFFFFFFFFFFF)
+GENERATED_SAMPLE_FILE_COLUMN = "_sample_file_id"
+GENERATED_SAMPLE_ROW_COLUMN = "_sample_row_id"
+ENCODED_LABEL_COLUMN = "_label"
+
+# Bumped whenever identity hashing or split assignment changes. It enters both the shared
+# S3 dataset key and the resume fingerprint, so prepared data written by an older algorithm
+# is never silently mixed with, or reused as, data written by a newer one.
+SPLIT_ALGORITHM_VERSION = 2
+
+# Independent of the split seed: the audit subsample must not correlate with split codes.
+AUDIT_IDENTITY_SALT = np.uint64(0x9E3779B97F4A7C15)
+
+
+class PreprocessingPauseRequested(RuntimeError):
+    """Raised after a durable source-file boundary when the Kaggle session is nearly over."""
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    config_path = Path(path)
+    with config_path.open("r", encoding="utf-8") as handle:
+        if config_path.suffix.casefold() == ".json":
+            config = json.load(handle)
+        else:
+            try:
+                import yaml
+            except ImportError as exc:
+                raise RuntimeError("YAML configuration requires PyYAML; JSON needs no extra dependency") from exc
+            config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        raise ValueError("Configuration root must be an object")
+    required = {"dataset", "split", "preprocessing", "output", "memory", "audit"}
+    missing = sorted(required.difference(config))
+    if missing:
+        raise ValueError(f"Missing configuration sections: {missing}")
+    ratios = [float(config["split"][name]) for name in SPLIT_NAMES]
+    if any(value <= 0 for value in ratios) or not math.isclose(sum(ratios), 1.0, abs_tol=1e-12):
+        raise ValueError("train/validation/test ratios must be positive and sum to 1")
+    if config["preprocessing"].get("scaling") != "none":
+        raise ValueError("This LightGBM baseline must not scale numeric features")
+    if int(config["output"]["rows_per_part"]) <= 0:
+        raise ValueError("output.rows_per_part must be positive")
+    return config
+
+
+def atomic_json_dump(payload: Mapping[str, Any], destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, destination)
+
+
+def discover_parquet_files(data_dir: str | Path, pattern: str) -> list[Path]:
+    root = Path(data_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {root}")
+    files = sorted(path for path in root.glob(pattern) if path.is_file())
+    if not files:
+        raise FileNotFoundError(f"No Parquet files matched {pattern!r} under {root}")
+    return files
+
+
+def infer_column(columns: Sequence[str], configured: str | None, candidates: Sequence[str]) -> str | None:
+    folded = {str(column).casefold(): str(column) for column in columns}
+    if configured:
+        found = folded.get(str(configured).casefold())
+        if found is None:
+            raise ValueError(f"Configured column {configured!r} was not found")
+        return found
+    for candidate in candidates:
+        found = folded.get(str(candidate).casefold())
+        if found is not None:
+            return found
+    return None
+
+
+def select_group_columns(columns: Sequence[str], candidates: Sequence[Sequence[str]]) -> list[str]:
+    folded = {str(column).casefold(): str(column) for column in columns}
+    for candidate_set in candidates:
+        actual = [folded.get(str(name).casefold()) for name in candidate_set]
+        if actual and all(name is not None for name in actual):
+            return [str(name) for name in actual]
+    return []
+
+
+def source_file_id(relative_path: str) -> int:
+    normalized = relative_path.replace("\\", "/")
+    return int.from_bytes(hashlib.blake2b(normalized.encode("utf-8"), digest_size=8).digest(), "big")
+
+
+def allocate_proportional_sample_quotas(
+    physical_rows: Mapping[str, int], target_total_rows: int
+) -> dict[str, int]:
+    """Allocate exactly target_total_rows with minimum proportional rounding error."""
+    if target_total_rows <= 0:
+        raise ValueError("dataset.target_total_rows must be positive")
+    total_rows = sum(int(value) for value in physical_rows.values())
+    if total_rows <= 0:
+        raise ValueError("Cannot sample an empty dataset")
+    target = min(int(target_total_rows), total_rows)
+    quotas = {
+        path: target * int(rows) // total_rows for path, rows in physical_rows.items()
+    }
+    remaining = target - sum(quotas.values())
+    ranked = sorted(
+        physical_rows,
+        key=lambda path: (-(target * int(physical_rows[path]) % total_rows), path),
+    )
+    for path in ranked[:remaining]:
+        quotas[path] += 1
+    assert sum(quotas.values()) == target
+    assert all(0 <= quotas[path] <= int(rows) for path, rows in physical_rows.items())
+    return quotas
+
+
+def deterministic_sample_row_ids(file_id: int, physical_rows: int, quota: int, seed: int) -> np.ndarray:
+    """Select an exact, repeatable simple-random sample without replacement."""
+    if not 0 <= quota <= physical_rows:
+        raise ValueError("Sample quota must be between zero and the physical row count")
+    if quota == physical_rows:
+        return np.arange(physical_rows, dtype=np.uint64)
+    seed_sequence = np.random.SeedSequence([
+        int(seed), int(file_id & 0xFFFFFFFF), int((file_id >> 32) & 0xFFFFFFFF)
+    ])
+    rng = np.random.default_rng(seed_sequence)
+    return np.sort(rng.choice(physical_rows, size=quota, replace=False, shuffle=False)).astype(
+        np.uint64, copy=False
+    )
+
+
+def build_sampling_plan(files: Sequence[Path], root: Path, dataset_cfg: Mapping[str, Any]) -> dict[str, int]:
+    physical = {
+        path.relative_to(root).as_posix(): int(pq.ParquetFile(path).metadata.num_rows)
+        for path in files
+    }
+    samples_per_file = dataset_cfg.get("samples_per_file")
+    target_total_rows = dataset_cfg.get("target_total_rows")
+    if samples_per_file is not None and target_total_rows is not None:
+        raise ValueError("samples_per_file and target_total_rows are mutually exclusive")
+    if target_total_rows is not None:
+        return allocate_proportional_sample_quotas(physical, int(target_total_rows))
+    if samples_per_file is not None:
+        if int(samples_per_file) <= 0:
+            raise ValueError("dataset.samples_per_file must be positive")
+        return {path: min(rows, int(samples_per_file)) for path, rows in physical.items()}
+    return physical
+
+
+def _splitmix64(values: np.ndarray) -> np.ndarray:
+    z = values.astype(np.uint64, copy=True)
+    with np.errstate(over="ignore"):
+        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        return (z ^ (z >> np.uint64(31))) & MASK64
+
+
+def split_codes_from_hashes(hashes: np.ndarray, ratios: Sequence[float], seed: int) -> np.ndarray:
+    mixed = _splitmix64(hashes.astype(np.uint64, copy=False) ^ np.uint64(seed))
+    unit = mixed.astype(np.float64) / float(2**64)
+    first = float(ratios[0])
+    second = first + float(ratios[1])
+    return np.where(unit < first, 0, np.where(unit < second, 1, 2)).astype(np.int8)
+
+
+def assign_row_split_codes(file_id: int, row_ids: np.ndarray, ratios: Sequence[float], seed: int) -> np.ndarray:
+    return split_codes_from_hashes(row_ids.astype(np.uint64, copy=False) ^ np.uint64(file_id), ratios, seed)
+
+
+def canonical_group_values(series: pd.Series) -> pd.Series:
+    """Render one group column so the same real-world entity always yields one string.
+
+    The source Parquet files do not agree on dtype: a port can arrive as int64 in one file
+    and float64 in another, and a Flow ID can carry stray whitespace. A plain ``astype`` then
+    produces "80" here and "80.0" there, which would hash the same flow into two different
+    splits — exactly the leakage the group-aware split exists to prevent.
+    """
+    if pd.api.types.is_bool_dtype(series):
+        return series.astype("boolean").astype("string")
+    if pd.api.types.is_integer_dtype(series):
+        return series.astype("Int64").astype("string")
+    if pd.api.types.is_float_dtype(series):
+        raw = series.to_numpy(dtype="float64", na_value=np.nan)
+        integral = np.isfinite(raw) & (raw == np.trunc(raw))
+        fractional = pd.Series(pd.array(raw, dtype="Float64"), index=series.index).astype("string")
+        whole = pd.Series(
+            pd.array(np.where(integral, raw, np.nan), dtype="Float64"), index=series.index
+        ).astype("Int64").astype("string")
+        return fractional.where(~integral, whole)
+    return series.astype("string").str.strip()
+
+
+def group_hashes(frame: pd.DataFrame, group_columns: Sequence[str]) -> np.ndarray:
+    canonical = pd.DataFrame(
+        {column: canonical_group_values(frame[column]) for column in group_columns},
+        index=frame.index,
+    ).fillna("<NA>")
+    return pd.util.hash_pandas_object(canonical, index=False, categorize=True).to_numpy(dtype=np.uint64)
+
+
+def audit_identity_hashes(values: np.ndarray) -> np.ndarray:
+    """Mix identities with a salt unrelated to the split seed, for unbiased audit sampling."""
+    return _splitmix64(values.astype(np.uint64, copy=False) ^ AUDIT_IDENTITY_SALT)
+
+
+def _canonical_label(value: Any) -> str:
+    if pd.isna(value):
+        raise ValueError("Missing target label encountered")
+    label = str(value).strip()
+    if not label:
+        raise ValueError("Empty target label encountered")
+    return label
+
+
+class ExactLeakageAuditor:
+    """Disk-backed exact audit of generated 128-bit sample IDs and group hashes."""
+
+    def __init__(self, database_path: Path, batch_rows: int) -> None:
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        if database_path.exists():
+            database_path.unlink()
+        self.connection = sqlite3.connect(database_path)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
+        self.connection.execute(
+            "CREATE TABLE identities (kind TEXT NOT NULL, identity BLOB NOT NULL, split INTEGER NOT NULL, "
+            "PRIMARY KEY(kind, identity)) WITHOUT ROWID"
+        )
+        self.connection.execute(
+            "CREATE TEMP TABLE audit_batch (identity BLOB PRIMARY KEY) WITHOUT ROWID"
+        )
+        self.batch_rows = int(batch_rows)
+        if self.batch_rows <= 0:
+            raise ValueError("audit.sqlite_batch_rows must be positive")
+        self.sample_cross_split = 0
+        self.group_cross_split = 0
+        self.sample_duplicates_within_split = 0
+
+    def _add_batch(self, kind: str, identities: Iterable[bytes], split_code: int) -> None:
+        iterator = iter(identities)
+        while True:
+            batch: list[tuple[bytes]] = []
+            try:
+                for _ in range(self.batch_rows):
+                    batch.append((next(iterator),))
+            except StopIteration:
+                pass
+            if not batch:
+                break
+            self.connection.execute("DELETE FROM audit_batch")
+            self.connection.executemany("INSERT OR IGNORE INTO audit_batch(identity) VALUES (?)", batch)
+            cross = int(self.connection.execute(
+                "SELECT COUNT(*) FROM audit_batch AS batch "
+                "JOIN identities AS known ON known.kind=? AND known.identity=batch.identity "
+                "WHERE known.split<>?",
+                (kind, int(split_code)),
+            ).fetchone()[0])
+            same = int(self.connection.execute(
+                "SELECT COUNT(*) FROM audit_batch AS batch "
+                "JOIN identities AS known ON known.kind=? AND known.identity=batch.identity "
+                "WHERE known.split=?",
+                (kind, int(split_code)),
+            ).fetchone()[0])
+            if kind == "sample":
+                self.sample_cross_split += cross
+                self.sample_duplicates_within_split += same
+            else:
+                self.group_cross_split += cross
+            self.connection.execute(
+                "INSERT OR IGNORE INTO identities(kind, identity, split) "
+                "SELECT ?, identity, ? FROM audit_batch",
+                (kind, int(split_code)),
+            )
+            self.connection.commit()
+
+    def add_samples(self, file_id: int, row_ids: np.ndarray, split_code: int) -> None:
+        identities = (struct.pack(">QQ", int(file_id), int(row_id)) for row_id in row_ids)
+        self._add_batch("sample", identities, split_code)
+
+    def add_groups(self, hashes: np.ndarray, split_code: int) -> None:
+        unique = np.unique(hashes.astype(np.uint64, copy=False))
+        identities = (struct.pack(">Q", int(value)) for value in unique)
+        self._add_batch("group", identities, split_code)
+
+    def flush(self) -> None:
+        self.connection.commit()
+
+    def result(self, group_aware: bool) -> dict[str, Any]:
+        sample_passed = self.sample_cross_split == 0
+        group_passed = (not group_aware) or self.group_cross_split == 0
+        return {
+            "method": "exact_sqlite_primary_key",
+            "sample_id_cross_split_overlap_count": self.sample_cross_split,
+            "sample_id_duplicate_within_split_count": self.sample_duplicates_within_split,
+            "group_cross_split_overlap_count": self.group_cross_split,
+            "sample_id_assertion_passed": sample_passed,
+            "group_assertion_passed": group_passed,
+            "passed": sample_passed and group_passed,
+            "assertions": {
+                "train_intersection_validation_is_empty": sample_passed,
+                "train_intersection_test_is_empty": sample_passed,
+                "validation_intersection_test_is_empty": sample_passed,
+            },
+        }
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+class SampledExactLeakageAuditor:
+    """Exact cross-split overlap check on a deterministic 1-in-K identity subsample.
+
+    The previous backend for full-dataset runs reported ``passed: True`` without looking at
+    any data, on the argument that split code is a pure function of identity. That argument
+    is sound only while the premise holds, and the premise is precisely what a bug breaks:
+    if the same flow is rendered differently in two source files, it hashes to two identities
+    and lands in two splits, and a proof-by-construction cannot see it.
+
+    This backend keeps every identity whose salted hash is divisible by
+    ``audit.identity_sample_divisor`` and intersects those sets exactly. Memory stays bounded
+    by the divisor rather than by the dataset, and the retained identities are appended to
+    durable files after each source file so a resumed session continues the same audit.
+
+    Detection power is explicit and reported: an overlap affecting ``m`` identities escapes
+    with probability ``(1 - 1/K)^m``, so a systematic rendering bug — which affects a large
+    share of identities — is caught with probability indistinguishable from one, while a
+    single unlucky identity may not be.
+    """
+
+    KINDS = ("sample", "group")
+
+    def __init__(
+        self, state_dir: Path, sample_divisor: int, maximum_tracked_identities: int
+    ) -> None:
+        self.state_dir = Path(state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.sample_divisor = int(sample_divisor)
+        if self.sample_divisor <= 0:
+            raise ValueError("audit.identity_sample_divisor must be positive")
+        self.maximum_tracked_identities = int(maximum_tracked_identities)
+        if self.maximum_tracked_identities <= 0:
+            raise ValueError("audit.maximum_tracked_identities must be positive")
+        self.buffers: dict[tuple[str, int], list[np.ndarray]] = defaultdict(list)
+        self.observed = {kind: 0 for kind in self.KINDS}
+        # Counted once from any state a previous session left behind, then kept incrementally:
+        # re-listing the directory on every chunk would cost a stat per split per row group.
+        self.tracked = sum(path.stat().st_size // 8 for path in self.state_files())
+
+    def path_for(self, kind: str, split_code: int) -> Path:
+        return self.state_dir / f"{kind}_{SPLIT_NAMES[int(split_code)]}.u64"
+
+    def state_files(self) -> list[Path]:
+        return sorted(path for path in self.state_dir.glob("*.u64"))
+
+    def _retain(self, kind: str, identities: np.ndarray, split_code: int) -> None:
+        if not len(identities):
+            return
+        self.observed[kind] += int(len(identities))
+        mixed = audit_identity_hashes(identities)
+        kept = identities[mixed % np.uint64(self.sample_divisor) == np.uint64(0)]
+        if not len(kept):
+            return
+        self.buffers[(kind, int(split_code))].append(kept.astype(np.uint64, copy=True))
+        self.tracked += int(len(kept))
+        if self.tracked > self.maximum_tracked_identities:
+            raise ValueError(
+                f"Leakage audit is tracking more than {self.maximum_tracked_identities} identities; "
+                "raise audit.identity_sample_divisor or audit.maximum_tracked_identities"
+            )
+
+    def add_samples(self, file_id: int, row_ids: np.ndarray, split_code: int) -> None:
+        identities = row_ids.astype(np.uint64, copy=False) ^ np.uint64(file_id)
+        self._retain("sample", identities, split_code)
+
+    def add_groups(self, hashes: np.ndarray, split_code: int) -> None:
+        self._retain("group", np.unique(hashes.astype(np.uint64, copy=False)), split_code)
+
+    def flush(self) -> None:
+        """Append retained identities durably; called at every source-file boundary."""
+        for (kind, split_code), chunks in list(self.buffers.items()):
+            if not chunks:
+                continue
+            path = self.path_for(kind, split_code)
+            with path.open("ab") as handle:
+                for chunk in chunks:
+                    handle.write(chunk.astype("<u8", copy=False).tobytes())
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.buffers[(kind, split_code)] = []
+
+    def _load(self, kind: str, split_code: int) -> np.ndarray:
+        path = self.path_for(kind, split_code)
+        stored = (
+            np.fromfile(path, dtype="<u8") if path.exists() else np.empty(0, dtype=np.uint64)
+        )
+        chunks = self.buffers.get((kind, int(split_code)), [])
+        if chunks:
+            stored = np.concatenate([stored, *chunks])
+        return stored.astype(np.uint64, copy=False)
+
+    def _overlaps(self, kind: str) -> tuple[dict[str, int], int, int, int]:
+        retained = [self._load(kind, code) for code in range(len(SPLIT_NAMES))]
+        unique = [np.unique(values) for values in retained]
+        duplicates = sum(len(values) - len(distinct) for values, distinct in zip(retained, unique))
+        pairs = {
+            f"{SPLIT_NAMES[left]}_intersection_{SPLIT_NAMES[right]}": int(
+                len(np.intersect1d(unique[left], unique[right], assume_unique=True))
+            )
+            for left in range(len(SPLIT_NAMES))
+            for right in range(left + 1, len(SPLIT_NAMES))
+        }
+        return pairs, sum(pairs.values()), duplicates, sum(len(values) for values in unique)
+
+    def result(self, group_aware: bool) -> dict[str, Any]:
+        self.flush()
+        sample_pairs, sample_cross, sample_duplicates, sample_tracked = self._overlaps("sample")
+        group_pairs, group_cross, _, group_tracked = self._overlaps("group")
+        sample_passed = sample_cross == 0
+        group_passed = (not group_aware) or group_cross == 0
+        return {
+            "passed": sample_passed and group_passed,
+            "method": "exact_intersection_on_deterministic_identity_subsample",
+            "identity_sample_divisor": self.sample_divisor,
+            "sampled_fraction": 1.0 / self.sample_divisor,
+            # "seen" counts occurrences as they streamed past, including a group that
+            # reappears in several row groups; "tracked" counts distinct retained identities.
+            "sample_identities_seen": self.observed["sample"],
+            "sample_identities_tracked_distinct": sample_tracked,
+            "group_occurrences_seen": self.observed["group"],
+            "group_identities_tracked_distinct": group_tracked,
+            "sample_id_cross_split_overlap_count": sample_cross,
+            "sample_id_duplicate_within_split_count": sample_duplicates,
+            "group_cross_split_overlap_count": group_cross,
+            "sample_id_assertion_passed": sample_passed,
+            "group_assertion_passed": group_passed,
+            "sample_cross_split_count": sample_cross,
+            "group_cross_split_count": group_cross,
+            "sample_duplicates_within_split": sample_duplicates,
+            "group_aware": bool(group_aware),
+            "assertions": {
+                f"{name}_is_empty": value == 0 for name, value in sample_pairs.items()
+            },
+            "checks": {
+                "sample_pairwise_intersection_sizes": sample_pairs,
+                "group_pairwise_intersection_sizes": group_pairs,
+            },
+            "detection_power": (
+                "An overlap affecting m distinct identities escapes this audit with "
+                f"probability (1 - 1/{self.sample_divisor})^m."
+            ),
+            "constructive_proof": {
+                "claim": (
+                    "split_codes_from_hashes is a pure function of the identity hash, so one "
+                    "identity cannot receive two split codes."
+                ),
+                "premise_verified_empirically_by": "the exact subsample intersection above",
+                "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
+            },
+        }
+
+    def close(self) -> None:
+        self.flush()
+
+
+SUPPORTED_AUDIT_BACKENDS = ("sampled_exact", "sqlite")
+
+
+def validate_audit_backend(backend: str) -> str:
+    """Reject an unusable audit backend before any I/O, not hours into the run."""
+    if backend == "deterministic_proof":
+        raise ValueError(
+            "audit.backend='deterministic_proof' asserted success without inspecting any data "
+            "and has been removed; use 'sampled_exact' for full-dataset runs or 'sqlite' for "
+            "small ones"
+        )
+    if backend not in SUPPORTED_AUDIT_BACKENDS:
+        raise ValueError(
+            f"Unsupported audit.backend: {backend!r}; expected one of {list(SUPPORTED_AUDIT_BACKENDS)}"
+        )
+    return backend
+
+
+def audit_state_files(destination: Path, auditor: Any) -> list[str]:
+    """Dataset-relative paths of the auditor's durable state, for S3 round-tripping."""
+    if not hasattr(auditor, "state_files"):
+        return []
+    return [path.relative_to(destination).as_posix() for path in auditor.state_files()]
+
+
+def enforce_leakage_audit(
+    leakage: Mapping[str, Any], audit_cfg: Mapping[str, Any], group_aware: bool
+) -> None:
+    """Turn the audit result into a hard failure, honouring the configured fail switches."""
+    if bool(audit_cfg.get("fail_on_cross_split_overlap", True)):
+        overlap = int(leakage["sample_id_cross_split_overlap_count"])
+        if overlap:
+            raise ValueError(f"Detected {overlap} sample IDs in multiple splits")
+    if group_aware and bool(audit_cfg.get("fail_on_group_cross_split_overlap", True)):
+        overlap = int(leakage["group_cross_split_overlap_count"])
+        if overlap:
+            raise ValueError(f"Detected {overlap} groups in multiple splits")
+
+
+def preflight_split_coverage(
+    files: Sequence[Path],
+    root: Path,
+    target: str | None,
+    group_columns: Sequence[str],
+    group_aware: bool,
+    sampling_plan: Mapping[str, int],
+    dataset_cfg: Mapping[str, Any],
+    split_cfg: Mapping[str, Any],
+    sampling_seed: int,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    """Derive the label-by-split matrix from identifier columns only, before any heavy work.
+
+    The full-dataset preparation costs hours, and the "every class appears in every split"
+    requirement could previously only fail on the very last statement of that work. Split
+    codes depend on nothing but the label, group and identity columns, so the same verdict is
+    reachable from a narrow read of two to six columns in a few minutes.
+    """
+    ratios = [float(split_cfg[name]) for name in SPLIT_NAMES]
+    seed = int(split_cfg["seed"])
+    needed = [column for column in ([target] if target else []) + list(group_columns) if column]
+    counts = {split: Counter() for split in SPLIT_NAMES}
+    for path in files:
+        relative = path.relative_to(root).as_posix()
+        file_id = source_file_id(relative)
+        parquet = pq.ParquetFile(path)
+        physical_rows = int(parquet.metadata.num_rows)
+        quota = int(sampling_plan[relative])
+        # read_row_group addresses columns by their raw, unstripped Parquet names.
+        raw_names = normalized_schema_fields(parquet.schema_arrow)
+        projection = [raw_names[column].name for column in needed]
+        sampled_row_ids = None
+        if dataset_cfg.get("target_total_rows") is not None:
+            sampled_row_ids = deterministic_sample_row_ids(
+                file_id, physical_rows, quota, sampling_seed
+            )
+        selected_rows = quota if dataset_cfg.get("samples_per_file") is not None else None
+        for frame, offset in _iter_file_chunks(path, selected_rows, projection):
+            row_ids = np.arange(offset, offset + len(frame), dtype=np.uint64)
+            if sampled_row_ids is not None:
+                left = int(np.searchsorted(sampled_row_ids, np.uint64(offset), side="left"))
+                right = int(np.searchsorted(sampled_row_ids, np.uint64(offset + len(frame)), side="left"))
+                selected_in_group = sampled_row_ids[left:right]
+                if not len(selected_in_group):
+                    continue
+                positions = (selected_in_group - np.uint64(offset)).astype(np.int64, copy=False)
+                frame = frame.iloc[positions].copy()
+                row_ids = selected_in_group
+            labels = (
+                pd.Series([path.stem] * len(frame), dtype="string")
+                if target is None
+                else frame[target].map(_canonical_label).astype("string")
+            )
+            if group_aware:
+                codes = split_codes_from_hashes(group_hashes(frame, group_columns), ratios, seed)
+            else:
+                codes = assign_row_split_codes(file_id, row_ids, ratios, seed)
+            for code, split in enumerate(SPLIT_NAMES):
+                positions = np.flatnonzero(codes == code)
+                if len(positions):
+                    counts[split].update(labels.iloc[positions].astype(str).tolist())
+            del frame, labels, codes, row_ids
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise PreprocessingPauseRequested(
+                "Session deadline reached during the split-coverage pre-flight; it restarts from "
+                "the beginning next session and costs only a narrow column read"
+            )
+    labels_seen = set().union(*(set(counter) for counter in counts.values())) if counts else set()
+    missing = {split: sorted(labels_seen.difference(counts[split])) for split in SPLIT_NAMES}
+    return {
+        "labels_seen": sorted(labels_seen),
+        "class_counts": {split: dict(sorted(counts[split].items())) for split in SPLIT_NAMES},
+        "sizes": {split: int(sum(counts[split].values())) for split in SPLIT_NAMES},
+        "classes_missing_from_split": missing,
+        "columns_read": needed,
+    }
+
+
+def _arrow_is_numeric(field: pa.Field) -> bool:
+    return pa.types.is_integer(field.type) or pa.types.is_floating(field.type) or pa.types.is_boolean(field.type)
+
+
+def normalized_schema_fields(schema: pa.Schema) -> dict[str, pa.Field]:
+    """Map stripped column names to fields and reject ambiguous whitespace collisions."""
+    fields: dict[str, pa.Field] = {}
+    for field in schema:
+        normalized = str(field.name).strip()
+        if not normalized:
+            raise ValueError("Parquet schema contains an empty column name after whitespace normalization")
+        if normalized in fields:
+            raise ValueError(f"Parquet schema has duplicate normalized column name: {normalized!r}")
+        fields[normalized] = field
+    return fields
+
+
+def _drop_reasons(
+    columns: Sequence[str], target: str | None, group_columns: Sequence[str], schema: pa.Schema,
+    preprocessing: Mapping[str, Any],
+) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    explicit = {str(value).casefold() for value in preprocessing.get("explicit_drop_columns", [])}
+    patterns = [re.compile(value, flags=re.IGNORECASE) for value in preprocessing.get("drop_name_patterns", [])]
+    field_map = normalized_schema_fields(schema)
+    arrow_types = {name: str(field.type) for name, field in field_map.items()}
+    drops: dict[str, str] = {}
+    features: list[str] = []
+    for column in columns:
+        if column == target:
+            drops[column] = "target column"
+        elif column.casefold() in explicit:
+            drops[column] = "explicitly excluded by configuration"
+        elif column in group_columns:
+            drops[column] = "group/flow identifier retained only for leakage-safe splitting"
+        elif next((pattern.pattern for pattern in patterns if pattern.search(column)), None) is not None:
+            pattern = next(pattern.pattern for pattern in patterns if pattern.search(column))
+            drops[column] = f"identifier/timestamp/leakage name pattern: {pattern}"
+        elif not _arrow_is_numeric(field_map[column]):
+            drops[column] = f"non-numeric Parquet dtype unsupported by baseline: {field_map[column].type}"
+        else:
+            features.append(column)
+    return features, drops, arrow_types
+
+
+def profile_dataset(
+    files: Sequence[Path], root: Path, feature_count: int, config: Mapping[str, Any],
+    sampling_plan: Mapping[str, int],
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    total_rows = 0
+    total_compressed = 0
+    for path in files:
+        parquet = pq.ParquetFile(path)
+        physical_rows = int(parquet.metadata.num_rows)
+        relative = path.relative_to(root).as_posix()
+        selected_rows = int(sampling_plan[relative])
+        size = int(path.stat().st_size)
+        total_rows += selected_rows
+        total_compressed += size
+        records.append({
+            "path": relative,
+            "physical_rows": physical_rows,
+            "selected_rows": selected_rows,
+            "columns": int(parquet.metadata.num_columns),
+            "row_groups": int(parquet.num_row_groups),
+            "compressed_bytes": size,
+        })
+    numeric_matrix_bytes = int(total_rows * feature_count * np.dtype(config["preprocessing"]["numeric_output_dtype"]).itemsize)
+    label_and_id_bytes = int(total_rows * (np.dtype(np.int32).itemsize + 2 * np.dtype(np.uint64).itemsize))
+    estimated_prepared_bytes = numeric_matrix_bytes + label_and_id_bytes
+    peak_multiplier = float(config["memory"]["lightgbm_peak_multiplier"])
+    estimated_training_peak = int(estimated_prepared_bytes * peak_multiplier)
+    memory = psutil.virtual_memory()
+    allowed = int(memory.available * float(config["memory"]["max_available_ram_fraction"]))
+    return {
+        "profile_version": 1,
+        "source_file_count": len(files),
+        "total_selected_rows": total_rows,
+        "feature_count": feature_count,
+        "source_compressed_bytes": total_compressed,
+        "estimated_numeric_matrix_bytes": numeric_matrix_bytes,
+        "estimated_prepared_split_bytes": estimated_prepared_bytes,
+        "estimated_lightgbm_training_peak_bytes": estimated_training_peak,
+        "lightgbm_peak_multiplier": peak_multiplier,
+        "ram_total_bytes": int(memory.total),
+        "ram_available_bytes_at_profile": int(memory.available),
+        "allowed_training_bytes": allowed,
+        "safe_to_materialize_for_lightgbm": estimated_training_peak <= allowed,
+        "platform": platform.platform(),
+        "cpu": platform.processor() or platform.machine(),
+        "files": records,
+    }
+
+
+class SplitPartWriter:
+    def __init__(
+        self,
+        root: Path,
+        compression: str,
+        rows_per_part: int,
+        existing_parts: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+        upload_callback: Any | None = None,
+    ) -> None:
+        self.root = root
+        self.compression = compression
+        self.rows_per_part = rows_per_part
+        self.buffers: dict[str, list[pd.DataFrame]] = defaultdict(list)
+        self.buffer_rows = Counter()
+        self.parts: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for split, values in dict(existing_parts or {}).items():
+            self.parts[split] = [dict(value) for value in values]
+        self.part_numbers = Counter({split: len(self.parts[split]) for split in SPLIT_NAMES})
+        self.upload_callback = upload_callback
+
+    def append(self, split: str, frame: pd.DataFrame) -> None:
+        if frame.empty:
+            return
+        self.buffers[split].append(frame)
+        self.buffer_rows[split] += len(frame)
+        if self.buffer_rows[split] >= self.rows_per_part:
+            self.flush(split)
+
+    def flush(self, split: str) -> None:
+        if not self.buffers[split]:
+            return
+        combined = pd.concat(self.buffers[split], ignore_index=True)
+        while len(combined) >= self.rows_per_part:
+            self._write(split, combined.iloc[: self.rows_per_part].copy())
+            combined = combined.iloc[self.rows_per_part :].reset_index(drop=True)
+        self.buffers[split] = [combined] if len(combined) else []
+        self.buffer_rows[split] = len(combined)
+        gc.collect()
+
+    def _write(self, split: str, frame: pd.DataFrame) -> None:
+        number = self.part_numbers[split]
+        self.part_numbers[split] += 1
+        relative = Path("splits") / split / f"part-{number:06d}.parquet"
+        destination = self.root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        frame.to_parquet(temporary, index=False, compression=self.compression)
+        metadata = pq.ParquetFile(temporary).metadata
+        if int(metadata.num_rows) != len(frame):
+            raise RuntimeError(f"Parquet verification failed for {temporary}")
+        os.replace(temporary, destination)
+        part = {"path": relative.as_posix(), "rows": len(frame), "bytes": destination.stat().st_size}
+        self.parts[split].append(part)
+        if self.upload_callback is not None:
+            self.upload_callback(destination, relative.as_posix())
+
+    def flush_all(self) -> None:
+        for split in SPLIT_NAMES:
+            if self.buffers[split]:
+                combined = pd.concat(self.buffers[split], ignore_index=True)
+                self._write(split, combined)
+            self.buffers[split] = []
+            self.buffer_rows[split] = 0
+
+    def close(self) -> None:
+        self.flush_all()
+
+
+def compute_data_version(config: Mapping[str, Any]) -> str:
+    """Fingerprint the preprocessing recipe, deliberately excluding the local data_dir.
+
+    Prepared splits are identical for every machine that applies the same recipe, so this
+    value keys the shared S3 dataset. Kaggle, Colab, and the GitHub runner mount the raw
+    Parquet at different paths and must still resolve to the same prepared dataset.
+    """
+    override = str(config["dataset"].get("data_version_override") or "").strip()
+    if override:
+        return override
+    ignored = {"data_dir", "data_version_override"}
+    dataset = {key: value for key, value in config["dataset"].items() if key not in ignored}
+    payload = {
+        "dataset": dataset,
+        "split": config["split"],
+        "preprocessing": config["preprocessing"],
+        "output": config["output"],
+        # Identity hashing lives in code, not configuration, so the recipe fingerprint has to
+        # carry its version; otherwise two incompatible split algorithms share one S3 key.
+        "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+class PreprocessingStore:
+    """Durable preprocessing state shared by every run built from the same recipe."""
+
+    def __init__(
+        self,
+        destination: Path,
+        data_version: str,
+        s3_config: Mapping[str, Any],
+        run_id: str | None = None,
+    ) -> None:
+        from checkpoint import S3Store
+
+        self.destination = destination
+        self.data_version = data_version
+        self.run_id = run_id
+        self.s3 = S3Store(s3_config, enabled_override=True)
+
+    def key(self, relative: str) -> str:
+        return self.s3.dataset_key(self.data_version, relative)
+
+    def restore(self) -> dict[str, Any] | None:
+        progress = self.s3.read_json(self.key("progress.json"))
+        if not progress:
+            return None
+        for split_parts in progress.get("parts", {}).values():
+            for part in split_parts:
+                relative = str(part["path"])
+                self.s3.download_file(self.key(relative), self.destination / relative, required=True)
+        # The leakage auditor accumulates across sessions, so its state has to come back too;
+        # without it a resumed run would audit only the files this session happened to process.
+        for relative in progress.get("audit_state_files", []):
+            self.s3.download_file(self.key(str(relative)), self.destination / str(relative), required=True)
+        if progress.get("status") == "complete":
+            for name in (
+                "data_profile.json", "label_mapping.json", "preprocessing.json",
+                "sample_manifest.json", "dataset_version.json",
+                "split_coverage_preflight.json",
+            ):
+                self.s3.download_file(self.key(name), self.destination / name, required=True)
+        return progress
+
+    def upload_part(self, path: Path, relative: str) -> None:
+        self.s3.upload_atomic(path, self.key(relative))
+
+    def upload_artifact(self, path: Path) -> None:
+        self.s3.upload_atomic(path, self.key(path.name))
+
+    def save_progress(self, payload: Mapping[str, Any]) -> None:
+        path = self.destination / "progress.json"
+        atomic_json_dump(dict(payload), path)
+        self.s3.upload_atomic(path, self.key("progress.json"))
+
+    def set_active(self, status: str, completed_files: int, total_files: int) -> None:
+        if not self.run_id:
+            return
+        from checkpoint import worker_environment, worker_id
+
+        pointer = {
+            "run_id": self.run_id,
+            "status": status,
+            "data_version": self.data_version,
+            "worker": worker_environment(),
+            "worker_id": worker_id(),
+            "current_iteration": 0,
+            "preprocessing_completed_files": int(completed_files),
+            "preprocessing_total_files": int(total_files),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        path = self.destination / "active_run.json"
+        atomic_json_dump(pointer, path)
+        self.s3.upload_atomic(path, self.s3.project_key("active_run.json"))
+
+
+def _iter_file_chunks(
+    path: Path, selected_rows: int | None, columns: Sequence[str] | None = None
+) -> Iterable[tuple[pd.DataFrame, int]]:
+    parquet = pq.ParquetFile(path)
+    offset = 0
+    remaining = selected_rows
+    for row_group in range(parquet.num_row_groups):
+        if remaining is not None and remaining <= 0:
+            break
+        frame = parquet.read_row_group(
+            row_group, columns=list(columns) if columns is not None else None
+        ).to_pandas()
+        if remaining is not None and len(frame) > remaining:
+            frame = frame.iloc[:remaining].copy()
+        frame.columns = [str(column).strip() for column in frame.columns]
+        if frame.columns.duplicated().any():
+            frame = frame.loc[:, ~frame.columns.duplicated(keep="first")]
+        yield frame, offset
+        offset += len(frame)
+        if remaining is not None:
+            remaining -= len(frame)
+
+
+def prepare_dataset(
+    config: Mapping[str, Any],
+    output_dir: str | Path,
+    preprocessing_store: PreprocessingStore | None = None,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    dataset_cfg = config["dataset"]
+    split_cfg = config["split"]
+    audit_backend = validate_audit_backend(str(config["audit"].get("backend", "sqlite")))
+    data_version = compute_data_version(config)
+    atomic_json_dump(
+        {"data_version": data_version, "prepared_at": datetime.now(timezone.utc).isoformat()},
+        destination / "dataset_version.json",
+    )
+
+    # Restore before touching the raw dataset: a second Colab session only needs the prepared
+    # splits from S3 and must not require the multi-gigabyte source Parquet to be present.
+    progress = preprocessing_store.restore() if preprocessing_store is not None else None
+    if progress and progress.get("status") == "complete":
+        manifest_path = destination / "sample_manifest.json"
+        if manifest_path.exists():
+            print(
+                f"Reusing prepared dataset {data_version} from S3; raw Parquet is not needed",
+                flush=True,
+            )
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    files = discover_parquet_files(dataset_cfg["data_dir"], dataset_cfg["file_pattern"])
+    root = Path(dataset_cfg["data_dir"])
+
+    schemas = [pq.ParquetFile(path).schema_arrow for path in files]
+    normalized_fields = [normalized_schema_fields(schema) for schema in schemas]
+    column_sets = [set(fields) for fields in normalized_fields]
+    common_columns = [name for name in normalized_fields[0] if all(name in values for values in column_sets)]
+    target = infer_column(common_columns, dataset_cfg.get("target_column"), dataset_cfg["target_column_candidates"])
+    if target is None and not dataset_cfg.get("label_from_filename_if_missing", False):
+        raise ValueError("No target column found and filename-derived labels are disabled")
+    group_columns = select_group_columns(common_columns, dataset_cfg.get("group_column_candidates", []))
+    if split_cfg.get("strategy") == "group_aware" and not group_columns:
+        raise ValueError("group_aware split was required but no configured group columns were found")
+    group_aware = bool(group_columns) and split_cfg.get("strategy") in {"group_aware", "auto_group_aware"}
+    features, drop_reasons, arrow_types = _drop_reasons(
+        common_columns, target, group_columns, schemas[0], config["preprocessing"]
+    )
+    for column in sorted(set.union(*column_sets).difference(common_columns)):
+        drop_reasons[column] = "not present in every source Parquet schema"
+    if not features:
+        raise ValueError("No numeric feature columns remain after exclusions")
+
+    sampling_plan = build_sampling_plan(files, root, dataset_cfg)
+    profile = profile_dataset(files, root, len(features), config, sampling_plan)
+    profile["source_dtypes"] = arrow_types
+    atomic_json_dump(profile, destination / "data_profile.json")
+
+    fingerprint_payload = {
+        "config": config,
+        "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
+        "files": [
+            {
+                "path": path.relative_to(root).as_posix(),
+                "rows": int(pq.ParquetFile(path).metadata.num_rows),
+                "bytes": int(path.stat().st_size),
+            }
+            for path in files
+        ],
+        "features": features,
+        "target": target,
+        "group_columns": group_columns,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if progress and progress.get("fingerprint") != fingerprint:
+        raise ValueError("Remote preprocessing checkpoint does not match the current dataset/configuration")
+
+    sampling_seed = int(dataset_cfg.get("sampling_seed", split_cfg["seed"]))
+    preflight_path = destination / "split_coverage_preflight.json"
+    preflight: dict[str, Any] | None = None
+    if preflight_path.exists():
+        cached = json.loads(preflight_path.read_text(encoding="utf-8"))
+        if cached.get("fingerprint") == fingerprint:
+            preflight = cached
+    if preflight is None:
+        print(
+            f"Pre-flight: deriving the label-by-split matrix from {len(files)} source files "
+            "before any feature conversion",
+            flush=True,
+        )
+        preflight = preflight_split_coverage(
+            files, root, target, group_columns, group_aware, sampling_plan,
+            dataset_cfg, split_cfg, sampling_seed, deadline_monotonic,
+        )
+        preflight["fingerprint"] = fingerprint
+        preflight["split_algorithm_version"] = SPLIT_ALGORITHM_VERSION
+        atomic_json_dump(preflight, preflight_path)
+        if preprocessing_store is not None:
+            preprocessing_store.upload_artifact(preflight_path)
+    if split_cfg.get("require_all_classes_each_split", True):
+        absent = {
+            split: values
+            for split, values in preflight["classes_missing_from_split"].items()
+            if values
+        }
+        if absent:
+            raise ValueError(
+                "Pre-flight rejected the split before any preprocessing work: classes missing "
+                f"from one or more splits: {absent}. Adjust split.seed or split.strategy, or set "
+                "split.require_all_classes_each_split=false to accept it."
+            )
+    empty = {split: size for split, size in preflight["sizes"].items() if size <= 0}
+    if empty:
+        raise ValueError(f"Pre-flight detected an empty split before preprocessing: {empty}")
+
+    ratios = [float(split_cfg[name]) for name in SPLIT_NAMES]
+    labels_seen: set[str] = set(progress.get("labels_seen", [])) if progress else set()
+    split_counts = {
+        name: Counter((progress or {}).get("split_counts", {}).get(name, {})) for name in SPLIT_NAMES
+    }
+    source_inventory: list[dict[str, Any]] = list((progress or {}).get("source_inventory", []))
+    completed_files = set((progress or {}).get("completed_files", []))
+    writer = SplitPartWriter(
+        destination,
+        str(config["output"]["compression"]),
+        int(config["output"]["rows_per_part"]),
+        existing_parts=(progress or {}).get("parts", {}),
+        upload_callback=preprocessing_store.upload_part if preprocessing_store is not None else None,
+    )
+    if audit_backend == "sampled_exact":
+        auditor: Any = SampledExactLeakageAuditor(
+            destination / ".leakage_audit",
+            int(config["audit"].get("identity_sample_divisor", 64)),
+            int(config["audit"].get("maximum_tracked_identities", 8_000_000)),
+        )
+    elif audit_backend == "sqlite":
+        if progress:
+            raise ValueError(
+                "SQLite leakage auditing cannot resume; use audit.backend=sampled_exact"
+            )
+        auditor = ExactLeakageAuditor(
+            destination / ".leakage_audit.sqlite", int(config["audit"]["sqlite_batch_rows"])
+        )
+    samples_per_file = dataset_cfg.get("samples_per_file")
+    target_total_rows = dataset_cfg.get("target_total_rows")
+    if preprocessing_store is not None:
+        preprocessing_store.set_active("preparing", len(completed_files), len(files))
+    try:
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            if relative in completed_files:
+                continue
+            file_id = source_file_id(relative)
+            physical_rows = int(pq.ParquetFile(path).metadata.num_rows)
+            selected_rows = min(physical_rows, int(samples_per_file)) if samples_per_file is not None else None
+            sampled_row_ids = None
+            if target_total_rows is not None:
+                sampled_row_ids = deterministic_sample_row_ids(
+                    file_id, physical_rows, int(sampling_plan[relative]), sampling_seed
+                )
+            rows_processed = 0
+            for frame, offset in _iter_file_chunks(path, selected_rows):
+                row_ids = np.arange(offset, offset + len(frame), dtype=np.uint64)
+                if sampled_row_ids is not None:
+                    left = int(np.searchsorted(sampled_row_ids, np.uint64(offset), side="left"))
+                    right = int(np.searchsorted(sampled_row_ids, np.uint64(offset + len(frame)), side="left"))
+                    selected_in_group = sampled_row_ids[left:right]
+                    if not len(selected_in_group):
+                        del frame, row_ids
+                        continue
+                    positions = (selected_in_group - np.uint64(offset)).astype(np.int64, copy=False)
+                    frame = frame.iloc[positions].copy()
+                    row_ids = selected_in_group
+                if target is None:
+                    labels = pd.Series([path.stem] * len(frame), dtype="string")
+                else:
+                    labels = frame[target].map(_canonical_label).astype("string")
+                labels_seen.update(labels.unique().tolist())
+                if group_aware:
+                    hashes = group_hashes(frame, group_columns)
+                    codes = split_codes_from_hashes(hashes, ratios, int(split_cfg["seed"]))
+                else:
+                    hashes = np.empty(0, dtype=np.uint64)
+                    codes = assign_row_split_codes(file_id, row_ids, ratios, int(split_cfg["seed"]))
+                numeric = pd.DataFrame(index=frame.index)
+                for feature in features:
+                    values = pd.to_numeric(frame[feature], errors="coerce").to_numpy(dtype=np.float64, copy=True)
+                    values[~np.isfinite(values)] = np.nan
+                    numeric[feature] = values.astype(config["preprocessing"]["numeric_output_dtype"])
+                numeric[GENERATED_SAMPLE_FILE_COLUMN] = np.full(len(frame), file_id, dtype=np.uint64)
+                numeric[GENERATED_SAMPLE_ROW_COLUMN] = row_ids
+                numeric["_label_name"] = labels.to_numpy()
+                for code, split in enumerate(SPLIT_NAMES):
+                    positions = np.flatnonzero(codes == code)
+                    if not len(positions):
+                        continue
+                    auditor.add_samples(file_id, row_ids[positions], code)
+                    if group_aware:
+                        auditor.add_groups(hashes[positions], code)
+                    selected_labels = labels.iloc[positions].astype(str)
+                    split_counts[split].update(selected_labels.tolist())
+                    writer.append(split, numeric.iloc[positions].reset_index(drop=True))
+                rows_processed += len(frame)
+                del frame, labels, row_ids, hashes, codes, numeric
+                gc.collect()
+            source_inventory.append({
+                "path": relative,
+                "source_file_id_hex": f"{file_id:016x}",
+                "physical_rows": physical_rows,
+                "planned_sample_rows": int(sampling_plan[relative]),
+                "rows_processed": rows_processed,
+            })
+            if rows_processed != int(sampling_plan[relative]):
+                raise RuntimeError(
+                    f"Sampling count mismatch for {relative}: {rows_processed} != {sampling_plan[relative]}"
+                )
+            writer.flush_all()
+            auditor.flush()
+            completed_files.add(relative)
+            progress_payload = {
+                "format_version": 1,
+                "status": "preparing",
+                "fingerprint": fingerprint,
+                "completed_files": sorted(completed_files),
+                "labels_seen": sorted(labels_seen),
+                "split_counts": {
+                    split: dict(sorted(split_counts[split].items())) for split in SPLIT_NAMES
+                },
+                "source_inventory": source_inventory,
+                "parts": {split: writer.parts[split] for split in SPLIT_NAMES},
+                "audit_state_files": audit_state_files(destination, auditor),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if preprocessing_store is not None:
+                for relative_audit in progress_payload["audit_state_files"]:
+                    preprocessing_store.upload_part(destination / relative_audit, relative_audit)
+                preprocessing_store.save_progress(progress_payload)
+                preprocessing_store.set_active("preparing", len(completed_files), len(files))
+            print(f"Prepared and durably checkpointed source {len(completed_files)}/{len(files)}: {relative}")
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise PreprocessingPauseRequested(
+                    f"Preprocessing paused safely after {len(completed_files)}/{len(files)} source files"
+                )
+        writer.close()
+        leakage = auditor.result(group_aware)
+    finally:
+        auditor.close()
+
+    label_mapping = {label: index for index, label in enumerate(sorted(labels_seen))}
+    atomic_json_dump(label_mapping, destination / "label_mapping.json")
+    for split in SPLIT_NAMES:
+        for part in writer.parts[split]:
+            path = destination / part["path"]
+            frame = pd.read_parquet(path)
+            frame[ENCODED_LABEL_COLUMN] = frame.pop("_label_name").map(label_mapping).astype(np.int32)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            frame.to_parquet(temporary, index=False, compression=config["output"]["compression"])
+            os.replace(temporary, path)
+            part["bytes"] = path.stat().st_size
+            if preprocessing_store is not None:
+                preprocessing_store.upload_part(path, str(part["path"]))
+            del frame
+
+    # Plain asserts vanish under `python -O`; these are data-integrity gates, not debug aids.
+    split_sizes = {split: int(sum(split_counts[split].values())) for split in SPLIT_NAMES}
+    processed = sum(item["rows_processed"] for item in source_inventory)
+    if sum(split_sizes.values()) != processed:
+        raise ValueError(
+            f"Split sizes {split_sizes} do not account for {processed} processed rows"
+        )
+    empty_splits = {split: size for split, size in split_sizes.items() if size <= 0}
+    if empty_splits:
+        raise ValueError(f"Empty split detected: {split_sizes}")
+    missing = {split: sorted(labels_seen.difference(split_counts[split])) for split in SPLIT_NAMES}
+    if split_cfg.get("require_all_classes_each_split", True) and any(missing.values()):
+        raise ValueError(f"Classes missing from one or more splits: {missing}")
+    if preflight["classes_missing_from_split"] != missing:
+        raise ValueError(
+            "The split-coverage pre-flight disagrees with the realized split: "
+            f"pre-flight={preflight['classes_missing_from_split']}, realized={missing}"
+        )
+    enforce_leakage_audit(leakage, config["audit"], group_aware)
+
+    preprocessing = {
+        "preprocessing_version": 1,
+        "fit_split": "train",
+        "target_column": target,
+        "label_source": "column" if target else "parquet_filename",
+        "feature_columns_in_order": features,
+        "feature_dtypes": {feature: config["preprocessing"]["numeric_output_dtype"] for feature in features},
+        "categorical_features": [],
+        "dropped_columns": [{"column": column, "reason": reason} for column, reason in sorted(drop_reasons.items())],
+        "nan_inf_handling": config["preprocessing"]["nan_inf_policy"],
+        "scaling": "none",
+        "feature_selection": "none",
+        "imbalance_handling": "none",
+        "label_mapping_file": "label_mapping.json",
+    }
+    atomic_json_dump(preprocessing, destination / "preprocessing.json")
+    manifest = {
+        "manifest_version": 1,
+        "dataset_root": str(root),
+        "file_pattern": dataset_cfg["file_pattern"],
+        "sampling_mode": (
+            "deterministic_proportional_exact_total"
+            if target_total_rows is not None
+            else ("full" if samples_per_file is None else "smoke_prefix_per_file")
+        ),
+        "samples_per_file": samples_per_file,
+        "target_total_rows": target_total_rows,
+        "sampling_seed": sampling_seed if target_total_rows is not None else None,
+        "sampling_method": (
+            "Per-file quotas use largest-remainder proportional allocation by physical row count; "
+            "rows are sampled uniformly without replacement using a stable file-specific seeded generator."
+            if target_total_rows is not None else None
+        ),
+        "class_rebalancing": "none",
+        "source_files": source_inventory,
+        "sample_id_definition": {
+            "fields": [GENERATED_SAMPLE_FILE_COLUMN, GENERATED_SAMPLE_ROW_COLUMN],
+            "file_id": "BLAKE2b-64 of normalized dataset-relative path",
+            "row_id": "zero-based physical row number in the source Parquet file",
+        },
+        "split": {
+            "method": "deterministic group hash" if group_aware else "deterministic sample-ID hash stratified by label source",
+            "group_aware": group_aware,
+            "group_columns": group_columns,
+            "seed": int(split_cfg["seed"]),
+            "ratios": {name: float(split_cfg[name]) for name in SPLIT_NAMES},
+            "sizes": split_sizes,
+            "class_counts": {split: dict(sorted(split_counts[split].items())) for split in SPLIT_NAMES},
+            "classes_missing_from_split": missing,
+            "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
+            "preflight": {
+                "columns_read": preflight["columns_read"],
+                "sizes": preflight["sizes"],
+                "classes_missing_from_split": preflight["classes_missing_from_split"],
+                "agrees_with_realized_split": True,
+            },
+            "performed_before_feature_conversion": True,
+            "performed_before_lightgbm_dataset_creation": True,
+            "natural_class_distribution_preserved": True,
+        },
+        "leakage_audit": leakage,
+        "parts": {split: writer.parts[split] for split in SPLIT_NAMES},
+    }
+    atomic_json_dump(manifest, destination / "sample_manifest.json")
+    if preprocessing_store is not None:
+        for path in (
+            destination / "data_profile.json",
+            destination / "label_mapping.json",
+            destination / "preprocessing.json",
+            destination / "sample_manifest.json",
+            destination / "dataset_version.json",
+            destination / "split_coverage_preflight.json",
+        ):
+            preprocessing_store.upload_artifact(path)
+        preprocessing_store.save_progress({
+            "format_version": 1,
+            "status": "complete",
+            "fingerprint": fingerprint,
+            "completed_files": sorted(completed_files),
+            "labels_seen": sorted(labels_seen),
+            "split_counts": {split: dict(sorted(split_counts[split].items())) for split in SPLIT_NAMES},
+            "source_inventory": source_inventory,
+            "parts": {split: writer.parts[split] for split in SPLIT_NAMES},
+            "audit_state_files": audit_state_files(destination, auditor),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        preprocessing_store.set_active("preparing", len(completed_files), len(files))
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise PreprocessingPauseRequested(
+                "Preprocessing completed durably; training is deferred to a fresh Kaggle session"
+            )
+    return manifest
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="config/data.json")
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--output-dir", default="outputs/data")
+    parser.add_argument("--samples-per-file", type=int, default=None)
+    parser.add_argument("--target-total-rows", type=int, default=None)
+    parser.add_argument(
+        "--full-dataset",
+        action="store_true",
+        help="Process every physical row and override all configured sampling limits",
+    )
+    parser.add_argument("--s3-config", default=None)
+    parser.add_argument("--run-id", default=None)
+    parser.add_argument(
+        "--data-version",
+        default=None,
+        help="Override the derived prepared-dataset fingerprint used as the S3 dataset key",
+    )
+    parser.add_argument("--maximum-hours", type=float, default=0.0)
+    parser.add_argument("--stop-before-minutes", type=float, default=30.0)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    selected_modes = sum((args.samples_per_file is not None, args.target_total_rows is not None, args.full_dataset))
+    if selected_modes > 1:
+        raise ValueError("--samples-per-file, --target-total-rows, and --full-dataset are mutually exclusive")
+    config = load_config(args.config)
+    if args.data_dir is not None:
+        config["dataset"]["data_dir"] = args.data_dir
+    if args.samples_per_file is not None:
+        if args.samples_per_file <= 0:
+            raise ValueError("--samples-per-file must be positive")
+        config["dataset"]["samples_per_file"] = args.samples_per_file
+        config["dataset"]["target_total_rows"] = None
+    if args.target_total_rows is not None:
+        if args.target_total_rows <= 0:
+            raise ValueError("--target-total-rows must be positive")
+        config["dataset"]["samples_per_file"] = None
+        config["dataset"]["target_total_rows"] = args.target_total_rows
+    if args.full_dataset:
+        config["dataset"]["samples_per_file"] = None
+        config["dataset"]["target_total_rows"] = None
+    if args.data_version:
+        config["dataset"]["data_version_override"] = args.data_version
+    data_version = args.data_version or compute_data_version(config)
+    store = None
+    if args.s3_config:
+        s3_document = json.loads(Path(args.s3_config).read_text(encoding="utf-8"))
+        store = PreprocessingStore(
+            Path(args.output_dir), data_version, s3_document["s3"], run_id=args.run_id
+        )
+    elif args.run_id:
+        raise ValueError("--run-id updates the shared S3 pointer and therefore requires --s3-config")
+    # The worker exports one deadline for the whole session, and preprocessing has to respect
+    # it whether or not this invocation was also given a local budget: full-dataset
+    # preparation runs for hours and must stop on a source-file boundary rather than be
+    # killed mid-file when the runtime is reclaimed.
+    budgets: list[float] = []
+    if args.maximum_hours > 0:
+        usable = args.maximum_hours * 3600.0 - args.stop_before_minutes * 60.0
+        if usable <= 0:
+            raise ValueError("--stop-before-minutes must be less than --maximum-hours")
+        budgets.append(usable)
+    external_deadline = os.environ.get("PIPELINE_SESSION_DEADLINE_EPOCH")
+    if external_deadline:
+        budgets.append(max(0.0, float(external_deadline) - time.time()))
+    deadline = time.monotonic() + min(budgets) if budgets else None
+    try:
+        manifest = prepare_dataset(config, args.output_dir, store, deadline)
+    except PreprocessingPauseRequested as exc:
+        print(str(exc))
+        return 75
+    print(json.dumps({
+        "data_version": data_version,
+        "sample_manifest": str(Path(args.output_dir) / "sample_manifest.json"),
+        "split_sizes": manifest["split"]["sizes"],
+        "leakage_audit_passed": manifest["leakage_audit"]["passed"],
+    }, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

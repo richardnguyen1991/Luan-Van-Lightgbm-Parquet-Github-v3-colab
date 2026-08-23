@@ -1,0 +1,13 @@
+{
+  "project_name": "Luan-Van-Lightgbm-Parquet-Github-v3-colab",
+  "repository": "richardnguyen1991/Luan-Van-Lightgbm-Parquet-Github-v3-colab",
+  "colab_notebook_path": "colab_runner.ipynb",
+  "run_id": null,
+  "target_iteration": 100,
+  "heartbeat_stale_minutes": 30,
+  "fallback_after_minutes": 90,
+  "recent_fallback_guard_minutes": 45,
+  "maximum_session_attempts": 200,
+  "maximum_stagnant_restarts": 3,
+  "maximum_report_restarts": 12
+}

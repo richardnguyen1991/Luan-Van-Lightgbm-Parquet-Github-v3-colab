@@ -1,0 +1,161 @@
+name: Fallback worker
+
+# Continues the run inside a GitHub-hosted runner when Colab has gone quiet.
+#
+# `report` mode only reads finished artifacts (y_true.npy, y_prob.npy, the round-100
+# Booster) and always fits, so the thesis figures never depend on Colab being reachable.
+# `train` mode is best effort: the runner has far less RAM and disk than a Colab Pro
+# high-RAM runtime, so it checks capacity first and pauses cleanly instead of being
+# OOM-killed halfway through a boosting iteration.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What the runner should do
+        required: true
+        default: train
+        type: choice
+        options:
+          - train
+          - report
+      run_id:
+        description: Run to continue (blank resolves the active run from S3)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Shared with every worker that writes to the run, so the runner never trains
+  # concurrently with itself. Colab is kept out by the cooperative S3 lock in train.py.
+  group: lightgbm-v3-worker
+  cancel-in-progress: false
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      S3_PREFIX: ${{ secrets.S3_PREFIX }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pipeline dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Free disk space taken by preinstalled toolchains
+        if: inputs.mode == 'train'
+        shell: bash
+        run: |
+          # The prepared Parquet splits need far more room than a stock runner leaves free.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Set the session deadline
+        shell: bash
+        run: |
+          # 350 minute job limit minus a 25 minute margin for the final checkpoint upload.
+          deadline=$(python -c "import time; print(time.time() + 325 * 60)")
+          echo "PIPELINE_SESSION_DEADLINE_EPOCH=${deadline}" >> "${GITHUB_ENV}"
+
+      - name: Resolve the run id
+        id: run
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.run_id }}" ]]; then
+            echo "run_id=${{ inputs.run_id }}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          python - <<'PYTHON' >> "${GITHUB_OUTPUT}"
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from colab_orchestrator import S3State
+
+          active = S3State().read_json("active_run.json") or {}
+          run_id = str(active.get("run_id", ""))
+          if not run_id:
+              raise SystemExit("No active run exists in S3; start the Colab notebook first")
+          print(f"run_id={run_id}")
+          PYTHON
+
+      - name: Check runner capacity
+        id: capacity
+        if: inputs.mode == 'train'
+        shell: bash
+        run: |
+          free_disk_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          available_ram_gb=$(python -c "import psutil; print(int(psutil.virtual_memory().available / 1024 ** 3))")
+          minimum_disk_gb=20
+          echo "Runner capacity: ${available_ram_gb} GiB RAM, ${free_disk_gb} GiB disk"
+          if (( free_disk_gb < minimum_disk_gb )); then
+            echo "sufficient=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning title=Fallback training skipped::${free_disk_gb} GiB free disk is below the ${minimum_disk_gb} GiB minimum"
+          else
+            echo "sufficient=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Pull the prepared dataset from S3
+        if: inputs.mode == 'train' && steps.capacity.outputs.sufficient == 'true'
+        shell: bash
+        run: |
+          python scripts/sync_dataset.py pull --output-dir outputs/data
+          du -sh outputs/data
+
+      - name: Continue training
+        id: train
+        if: inputs.mode == 'train' && steps.capacity.outputs.sufficient == 'true'
+        shell: bash
+        run: |
+          set +e
+          python train.py \
+            --config config/train.gha.json \
+            --prepared-data-dir outputs/data \
+            --output-dir outputs/runs \
+            --run-id "${{ steps.run.outputs.run_id }}" \
+            --upload-checkpoints-to-s3
+          code=$?
+          set -e
+          echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
+          # 75 means the worker checkpointed and stepped aside on purpose, which is a success.
+          if [[ "${code}" == "0" || "${code}" == "75" ]]; then
+            echo "train.py exited with ${code}"
+            exit 0
+          fi
+          exit "${code}"
+
+      - name: Regenerate the final report from S3 artifacts
+        if: inputs.mode == 'report'
+        shell: bash
+        run: |
+          python make_report.py \
+            --run-dir "s3://${S3_BUCKET}/${S3_PREFIX}/${{ steps.run.outputs.run_id }}" \
+            --upload-to-s3
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Fallback worker"
+            echo ""
+            echo "- Mode: \`${{ inputs.mode }}\`"
+            echo "- Run: \`${{ steps.run.outputs.run_id }}\`"
+            echo "- Training exit code: \`${{ steps.train.outputs.exit_code || 'n/a' }}\`"
+            echo "- Capacity sufficient: \`${{ steps.capacity.outputs.sufficient || 'n/a' }}\`"
+          } | tee -a "${GITHUB_STEP_SUMMARY}"

@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+outputs/
+.ipynb_checkpoints/
+# Never commit credentials: secrets live in GitHub Secrets and Colab Secrets only.
+.env
+kaggle.json
+*.pem
+s3_presigned_config.json
