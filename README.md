@@ -69,6 +69,7 @@ GitHub Actions watchdog (30 phút/lần) ───┘
 | GitHub repo | `richardnguyen1991/Luan-Van-Lightgbm-Parquet-Github-v3-colab` (public) |
 | S3 bucket | `my-thesis-checkpoints` |
 | S3 prefix | `Luan-Van-Lightgbm-Parquet-Github-v3-colab` |
+| S3 region | `us-east-1` — giá trị của `AWS_DEFAULT_REGION` |
 | IAM user | `kaggle-checkpoint` (dùng lại từ pipeline Kaggle v2) — policy phải cho phép prefix `Luan-Van-Lightgbm-Parquet-Github-v3-colab/` |
 
 Sửa `repository` trong `config/orchestration.json` nếu bạn dùng tên repo khác, rồi chạy lại
