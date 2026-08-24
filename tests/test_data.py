@@ -58,6 +58,9 @@ class DataPipelineTest(unittest.TestCase):
             rng = np.random.default_rng(9)
             for label, rows in (("BENIGN", 900), ("DrDoS_DNS", 600), ("Syn", 300)):
                 frame = pd.DataFrame({
+                    # The pandas row index the source CSVs were converted with: numeric, and
+                    # perfectly predictive of the label because each file holds one class.
+                    "Unnamed: 0": np.arange(rows, dtype=np.int64),
                     "Flow ID": [f"{label}-{index}" for index in range(rows)],
                     "Timestamp": pd.date_range("2019-01-01", periods=rows, freq="s").astype(str),
                     " Feature A": rng.normal(size=rows),
@@ -97,6 +100,7 @@ class DataPipelineTest(unittest.TestCase):
             dropped = {item["column"] for item in preprocessing["dropped_columns"]}
             self.assertIn("Flow ID", dropped)
             self.assertIn("Timestamp", dropped)
+            self.assertIn("Unnamed: 0", dropped)
 
             split_frames = {}
             for split, parts in manifest["parts"].items():

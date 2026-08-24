@@ -16,9 +16,10 @@ từ boosting iteration kế tiếp.
 - Không early stopping, không tuning, không chọn vòng tốt nhất.
 - Không xử lý mất cân bằng: không class/sample weight, không oversampling/undersampling.
 - Toàn bộ train split dùng ở cả 100 vòng; validation chỉ theo dõi, test chỉ đánh giá một lần.
-- `feature_selection = "none"`: **dùng toàn bộ 81 thuộc tính**, không loại cột nào. Cơ chế
-  sàng lọc theo gain vẫn còn trong mã nguồn như một van xả RAM, nhưng mặc định tắt (xem
-  *Chọn thuộc tính theo gain*).
+- `feature_selection = "none"`: **dùng toàn bộ 80 thuộc tính** còn lại sau tiền xử lý, không
+  sàng lọc thêm cột nào. Cơ chế sàng lọc theo gain vẫn còn trong mã nguồn như một van xả RAM,
+  nhưng mặc định tắt (xem *Chọn thuộc tính theo gain*). Cột chỉ số dòng `Unnamed: 0` bị loại ở
+  bước tiền xử lý vì nó rò rỉ nhãn (xem *Cột `Unnamed: 0` và rò rỉ theo chỉ số dòng*).
 - CPU bắt buộc, seed cố định, `deterministic=true`, `force_col_wise=true`.
 - Checkpoint mỗi 10 vòng: Booster `.txt` + `training_state.json` + `history.json` append-only.
 - Model cuối luôn là `final_model_round_100.txt`.
@@ -205,16 +206,55 @@ tại. Con số quyết định run có sống sót hay không là thứ khác:
 thì `train.py` **thoát 75 (dừng an toàn)** chứ không để bị OOM-kill giữa iteration — checkpoint
 S3 còn nguyên, watchdog thử lại trên worker lớn hơn.
 
+## Cột `Unnamed: 0` và rò rỉ theo chỉ số dòng
+
+`Unnamed: 0` là `RangeIndex` của pandas bị ghi ra khi bộ CIC-DDoS2019 gốc được convert từ CSV
+sang Parquet. Nó **không** phải một đặc trưng mạng, nhưng bộ lọc tiền xử lý ban đầu để lọt nó
+vào tập huấn luyện: nó không phải target, không phải group id, là kiểu `int64` nên qua được
+kiểm tra kiểu số, và không khớp pattern nào trong `drop_name_patterns` (các pattern đó chỉ bắt
+flow id, src/dst ip/port, timestamp, simillarhttp).
+
+Hậu quả là rò rỉ nhãn nghiêm trọng. Dataset lưu **mỗi file một loại tấn công** và
+`label_from_filename_if_missing = true` suy nhãn từ tên file, nên chỉ số dòng và nhãn gần như
+tương ứng một-một: mỗi file đánh số lại từ 0 và có độ dài khác nhau, vài ngưỡng trên
+`Unnamed: 0` là tách được các lớp. LightGBM tìm ra ngay ở các split đầu tiên và `Unnamed: 0`
+chiếm ngôi đầu bảng `feature_importance_gain`. Chia train/val/test theo dòng **không** phá được
+quan hệ này — trong mỗi split nó vẫn nguyên vẹn. Metric của một run còn cột này bị thổi phồng
+và không nói lên điều gì về hành vi mạng.
+
+Bản vá là một dòng trong cả `config/data.json` lẫn `config/data.smoke.json`:
+
+```json
+"explicit_drop_columns": [
+  "Unnamed: 0"
+]
+```
+
+`_drop_reasons` so khớp `casefold()` nên hoa/thường không quan trọng, nhưng đây là so khớp
+**đúng tên**, không phải regex: nếu bộ dữ liệu của bạn còn `Unnamed: 0.1` hay `unnamed:_0` thì
+thêm từng tên vào danh sách, hoặc thêm một pattern `"^unnamed:?[_\\s]*\\d*(\\.\\d+)?$"` vào
+`drop_name_patterns`. Sau khi loại, `preprocessing.json → dropped_columns` phải có mục
+`{"column": "Unnamed: 0", "reason": "explicitly excluded by configuration"}` — đó là bằng chứng
+kiểm tra trong mục *Nghiệm thu*.
+
+Đổi tập cột làm đổi `feature_schema_hash`, nên đây là **một run mới** (`run_id` mới): guard
+resume trong `train.py` sẽ dừng có lỗi chứ không train tiếp lên checkpoint của run cũ. Mọi kết
+quả sinh trước bản vá này cần chạy lại, không so sánh trực tiếp được.
+
 ## Chọn thuộc tính theo gain (mặc định TẮT)
 
 > **Trạng thái hiện tại:** `feature_selection = "none"` trong cả hai profile — baseline chạy
-> với đủ 81 thuộc tính. Trên Colab Pro High-RAM, 81 cột cho đỉnh RAM dự phóng 25,7 GiB so với
-> ngân sách 38,4 GiB, nên van xả này không cần dùng tới. Mục dưới đây mô tả cơ chế để bạn bật
-> lại khi chạy trên máy nhỏ hơn — và để giải thích vì sao nó từng tồn tại.
+> với đủ 80 thuộc tính hợp lệ. Trên Colab Pro High-RAM, 80 cột cho đỉnh RAM dự phóng 25,7 GiB
+> so với ngân sách 38,4 GiB, nên van xả này không cần dùng tới. Mục dưới đây mô tả cơ chế để
+> bạn bật lại khi chạy trên máy nhỏ hơn — và để giải thích vì sao nó từng tồn tại.
 >
-> Giữ đủ 81 cột còn là điều kiện để so sánh công bằng với các model khác trong luận văn
+> Giữ đủ 80 cột còn là điều kiện để so sánh công bằng với các model khác trong luận văn
 > (GNN, GRU, MLP, Transformer, LSTM): khác tập đặc trưng thì chênh lệch kết quả không còn quy
 > được cho model nữa.
+>
+> Lưu ý phân biệt hai bước khác nhau: **tiền xử lý** loại cột theo luật cấu hình (target, group
+> id, `explicit_drop_columns`, `drop_name_patterns`, cột không phải kiểu số) và luôn chạy;
+> **sàng lọc theo gain** mới là thứ đang tắt. 80 là số cột còn lại sau bước thứ nhất.
 
 Bảng RAM ở trên có `features` nằm thẳng trong số hạng lớn nhất — `(train + val) × features ×
 1 byte` cho dataset đã binning. Ở quy mô đầy đủ, giữ toàn bộ cột số của CIC-DDoS2019 đẩy con
@@ -435,7 +475,9 @@ lượng và peak RSS.
    `sample_identities_tracked_distinct > 0` (chứng minh audit thực sự đã đọc dữ liệu).
 7. Tên và thứ tự thuộc tính của Booster khớp tuyệt đối `preprocessing.json`.
 8. `config/feature_selection.json` có `method = "none"` và
-   `selected_feature_count == candidate_feature_count` — chứng minh không cột nào bị loại.
+   `selected_feature_count == candidate_feature_count` — chứng minh **bước sàng lọc theo gain**
+   không loại cột nào (các cột bị tiền xử lý loại đã nằm trong `preprocessing.json →
+   dropped_columns` kèm lý do, và `Unnamed: 0` phải có mặt ở đó).
    (Nếu bật lại sàng lọc: `fit_split = "train"` và `ranking_by_gain` phủ hết cột ứng viên,
    chứng minh việc chọn cột không chạm vào validation/test.)
 9. Repo public không chứa `AKIA` hay secret trong `.ipynb`.

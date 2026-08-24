@@ -44,7 +44,9 @@
     "require_all_classes_each_split": true
   },
   "preprocessing": {
-    "explicit_drop_columns": [],
+    "explicit_drop_columns": [
+      "Unnamed: 0"
+    ],
     "drop_name_patterns": [
       "(^|[_\\s])flow([_\\s]?id)?$",
       "(^|[_\\s])(src|source)([_\\s]?(ip|port))?$",
