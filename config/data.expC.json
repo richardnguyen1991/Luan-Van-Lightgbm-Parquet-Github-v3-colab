@@ -40,7 +40,12 @@
     "validation": 0.15,
     "test": 0.15,
     "seed": 2026,
-    "strategy": "auto_group_aware",
+    "strategy": "by_capture_day",
+    "capture_day_column": "__capture_day",
+    "capture_day_assignment": {
+      "01-12": "train_validation"
+    },
+    "validation_fraction_of_train_day": 0.15,
     "require_all_classes_each_split": true
   },
   "labels": {
@@ -55,8 +60,24 @@
       "DrDoS_UDP": "UDP",
       "UDP-lag": "UDPLag"
     },
-    "keep_only": null,
-    "open_set_labels": []
+    "keep_only": [
+      "BENIGN",
+      "DNS",
+      "LDAP",
+      "MSSQL",
+      "NTP",
+      "NetBIOS",
+      "SNMP",
+      "SSDP",
+      "Syn",
+      "TFTP",
+      "UDP",
+      "UDPLag",
+      "WebDDoS"
+    ],
+    "open_set_labels": [
+      "Portmap"
+    ]
   },
   "preprocessing": {
     "explicit_drop_columns": [

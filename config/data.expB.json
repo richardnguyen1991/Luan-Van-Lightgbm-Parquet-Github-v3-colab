@@ -40,7 +40,13 @@
     "validation": 0.15,
     "test": 0.15,
     "seed": 2026,
-    "strategy": "auto_group_aware",
+    "strategy": "by_capture_day",
+    "capture_day_column": "__capture_day",
+    "capture_day_assignment": {
+      "01-12": "train_validation",
+      "03-11": "test"
+    },
+    "validation_fraction_of_train_day": 0.15,
     "require_all_classes_each_split": true
   },
   "labels": {
@@ -55,7 +61,14 @@
       "DrDoS_UDP": "UDP",
       "UDP-lag": "UDPLag"
     },
-    "keep_only": null,
+    "keep_only": [
+      "BENIGN",
+      "LDAP",
+      "MSSQL",
+      "NetBIOS",
+      "Syn",
+      "UDP"
+    ],
     "open_set_labels": []
   },
   "preprocessing": {

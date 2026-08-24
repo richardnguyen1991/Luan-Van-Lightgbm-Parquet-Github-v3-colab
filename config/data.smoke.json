@@ -34,9 +34,27 @@
     "strategy": "auto_group_aware",
     "require_all_classes_each_split": true
   },
+  "labels": {
+    "merge_map": {
+      "DrDoS_DNS": "DNS",
+      "DrDoS_LDAP": "LDAP",
+      "DrDoS_MSSQL": "MSSQL",
+      "DrDoS_NTP": "NTP",
+      "DrDoS_NetBIOS": "NetBIOS",
+      "DrDoS_SNMP": "SNMP",
+      "DrDoS_SSDP": "SSDP",
+      "DrDoS_UDP": "UDP",
+      "UDP-lag": "UDPLag"
+    },
+    "keep_only": null,
+    "open_set_labels": []
+  },
   "preprocessing": {
     "explicit_drop_columns": [
-      "Unnamed: 0"
+      "Unnamed: 0",
+      "__source_row_id",
+      "__source_file_id",
+      "__capture_day"
     ],
     "drop_name_patterns": [
       "(^|[_\\s])flow([_\\s]?id)?$",

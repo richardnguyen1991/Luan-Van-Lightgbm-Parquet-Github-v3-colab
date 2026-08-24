@@ -37,7 +37,7 @@ from model import (
     TrainingPauseRequested,
     build_datasets,
     continue_training,
-    macro_f1_metric,
+    multiclass_macro_metrics,
     validate_training_config,
 )
 
@@ -213,6 +213,7 @@ def _write_run_configuration(
     feature_selection: Mapping[str, Any],
     data_version: str | None,
     memory_estimate: Mapping[str, Any],
+    monitor_summary: Mapping[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     config_dir = run_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -239,12 +240,27 @@ def _write_run_configuration(
             "source_file_count": len(manifest["source_files"]),
             "physical_rows": physical_rows,
             "selected_rows": selected_rows,
+            "rows_excluded_by_label_policy": int(
+                manifest["split"].get("rows_excluded_by_label_policy", 0)
+            ),
+            "rows_excluded_by_unassigned_split": int(
+                manifest["split"].get("rows_excluded_by_unassigned_split", 0)
+            ),
+            # True only for the unrestricted experiment. B and C exclude rows on purpose,
+            # and the two counters above say exactly how many and why.
             "all_physical_rows_used": (
                 manifest["sampling_mode"] == "full" and selected_rows == physical_rows
             ),
             "split_sizes": dict(manifest["split"]["sizes"]),
             "leakage_audit_passed": bool(manifest["leakage_audit"]["passed"]),
+            "split_strategy": manifest["split"].get("strategy", "auto_group_aware"),
+            "capture_day_assignment": manifest["split"].get("capture_day_assignment"),
+            "group_audit_scope": manifest["split"].get("group_audit_scope"),
+            "label_policy": manifest.get("label_policy"),
+            "open_set_labels": manifest["split"].get("open_set_labels", []),
+            "open_set_only_splits": manifest["split"].get("open_set_only_splits", []),
         },
+        "monitoring": dict(monitor_summary) if monitor_summary else {"enabled": False},
         "params_hash": params_hash,
         "feature_schema_hash": feature_schema_hash,
         "feature_count": len(feature_names),
@@ -414,6 +430,14 @@ def train(args: argparse.Namespace) -> int:
             run_dir, config, bundle.params, bundle.params_hash, bundle.feature_schema_hash,
             bundle.label_mapping, bundle.feature_names, bundle.model_feature_names, lgb.__version__,
             bundle.feature_selection, _prepared_data_version(prepared), bundle.memory_estimate,
+            monitor_summary={
+                "enabled": bundle.monitor_dataset is not None,
+                "name": bundle.monitor_name,
+                "source_split": bundle.monitor_source_split,
+                "rows": int(len(bundle.monitor_indices)) if bundle.monitor_indices is not None else 0,
+                "selection": "deterministic class-proportional subsample, minimum one row per class",
+                "used_for_model_selection": False,
+            },
         )
         for path in sorted((run_dir / "config").glob("*.json")):
             manager.sync_artifact(run_id, path, "config")
@@ -491,11 +515,23 @@ def train(args: argparse.Namespace) -> int:
         maximum_session_hours=float(config["session"]["maximum_hours"]),
         stop_before_minutes=float(config["session"]["stop_before_minutes"]),
         environment=worker_environment(),
+        monitor_name=bundle.monitor_name,
     )
     callbacks = [recorder]
     period = int(config["logging"]["lightgbm_period"])
     if period > 0:
         callbacks.append(lgb.log_evaluation(period=period))
+    # A third evaluation set turns the learning-curve figure into the argument it needs to
+    # make: train and validation come from the same capture day and will lie on top of each
+    # other, while the held-out day separates. It is watched, never selected on -- early
+    # stopping is off and the round count is fixed at 100.
+    valid_sets = [bundle.train_dataset, bundle.validation_dataset]
+    valid_names = ["train", "validation"]
+    valid_features = {"validation": bundle.features["validation"]}
+    if bundle.monitor_dataset is not None:
+        valid_sets.append(bundle.monitor_dataset)
+        valid_names.append(bundle.monitor_name)
+        valid_features[bundle.monitor_name] = bundle.monitor_features
     try:
         # lightgbm.train(init_model=...) cannot resume a Parquet-Sequence Dataset; see
         # model.continue_training for the equivalent sequence of steps that can.
@@ -503,14 +539,14 @@ def train(args: argparse.Namespace) -> int:
             lgb,
             params=bundle.params,
             train_dataset=bundle.train_dataset,
-            valid_sets=[bundle.train_dataset, bundle.validation_dataset],
-            valid_names=["train", "validation"],
+            valid_sets=valid_sets,
+            valid_names=valid_names,
             num_boost_round=remaining_rounds(current_iteration, target),
-            feval=macro_f1_metric(len(bundle.label_mapping)),
+            feval=multiclass_macro_metrics(len(bundle.label_mapping)),
             callbacks=callbacks,
             num_class=len(bundle.label_mapping),
             train_features=bundle.features["train"],
-            valid_features={"validation": bundle.features["validation"]},
+            valid_features=valid_features,
             init_model_path=init_model,
             init_score_chunk_rows=int(config["dataset"].get("init_score_chunk_rows", 250000)),
         )

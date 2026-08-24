@@ -46,6 +46,13 @@
   "dataset": {
     "prepared_data_dir": "outputs/data-smoke",
     "require_full_dataset_manifest": false,
+    "monitor_split": {
+      "enabled": false,
+      "split": "test",
+      "name": "crossday",
+      "maximum_rows": 2000000,
+      "seed": 2026
+    },
     "require_safe_memory_profile": true,
     "loading_strategy": "parquet_sequence",
     "sequence_batch_rows": 4096,

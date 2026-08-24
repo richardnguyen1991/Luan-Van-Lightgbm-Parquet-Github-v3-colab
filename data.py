@@ -37,10 +37,23 @@ GENERATED_SAMPLE_FILE_COLUMN = "_sample_file_id"
 GENERATED_SAMPLE_ROW_COLUMN = "_sample_row_id"
 ENCODED_LABEL_COLUMN = "_label"
 
+# Encoded label reserved for open-set rows: classes deliberately withheld from training
+# that must still reach the test split so the report can show where the model sends an
+# attack family it has never seen.
+OPEN_SET_LABEL_CODE = -1
+# Split code for a row that no strategy claimed (a capture day with no configured role).
+UNASSIGNED_SPLIT_CODE = -1
+
+DEFAULT_CAPTURE_DAY_COLUMN = "__capture_day"
+CAPTURE_DAY_TRAIN_ROLE = "train_validation"
+CAPTURE_DAY_TEST_ROLE = "test"
+CAPTURE_DAY_ROLES = (CAPTURE_DAY_TRAIN_ROLE, CAPTURE_DAY_TEST_ROLE)
+SUPPORTED_SPLIT_STRATEGIES = ("auto_group_aware", "group_aware", "row_hash", "by_capture_day")
+
 # Bumped whenever identity hashing or split assignment changes. It enters both the shared
 # S3 dataset key and the resume fingerprint, so prepared data written by an older algorithm
 # is never silently mixed with, or reused as, data written by a newer one.
-SPLIT_ALGORITHM_VERSION = 2
+SPLIT_ALGORITHM_VERSION = 3
 
 # Independent of the split seed: the audit subsample must not correlate with split codes.
 AUDIT_IDENTITY_SALT = np.uint64(0x9E3779B97F4A7C15)
@@ -245,6 +258,172 @@ def _canonical_label(value: Any) -> str:
     if not label:
         raise ValueError("Empty target label encountered")
     return label
+
+
+class LabelPolicy:
+    """Rename, restrict and open-set-flag raw labels before any split code is assigned.
+
+    CIC-DDoS2019 names the same attack twice.  The 01-12 capture writes ``DrDoS_LDAP``
+    where the 03-11 capture writes ``LDAP``, and ``UDP-lag`` where the other writes
+    ``UDPLag`` -- the spelling tracks the capture day, not the traffic.  Scoring a model
+    on the raw 19 labels therefore penalises it for a labelling artifact, and a
+    train-on-one-day experiment is impossible outright: the raw label sets of the two
+    days intersect in exactly ``BENIGN`` and ``Syn``.
+
+    ``merge_map`` folds the duplicated pairs onto one name, ``keep_only`` restricts the
+    run to a chosen subset (the classes shared by both days, say), and
+    ``open_set_labels`` marks classes that must never be trained on but must still reach
+    the test split, encoded as :data:`OPEN_SET_LABEL_CODE`.
+    """
+
+    __slots__ = ("merge_map", "keep_only", "open_set")
+
+    def __init__(
+        self,
+        merge_map: Mapping[str, str] | None = None,
+        keep_only: Sequence[str] | None = None,
+        open_set_labels: Sequence[str] | None = None,
+    ) -> None:
+        self.merge_map = {
+            str(key).strip().casefold(): str(value).strip()
+            for key, value in (merge_map or {}).items()
+        }
+        keep = frozenset(str(value).strip() for value in keep_only) if keep_only else None
+        opened = frozenset(str(value).strip() for value in (open_set_labels or ()))
+        if keep is not None and keep & opened:
+            raise ValueError(
+                "labels.keep_only and labels.open_set_labels must be disjoint; both list "
+                f"{sorted(keep & opened)}"
+            )
+        if keep_only is not None and not keep:
+            raise ValueError("labels.keep_only was provided but empty")
+        self.keep_only = keep
+        self.open_set = opened
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.merge_map or self.keep_only is not None or self.open_set)
+
+    def merge(self, labels: pd.Series) -> pd.Series:
+        """Map raw label strings onto their merged names, leaving unlisted names alone."""
+        text = labels.astype("string")
+        if not self.merge_map:
+            return text
+        replaced = text.str.strip().str.casefold().map(self.merge_map).astype("string")
+        return replaced.where(replaced.notna(), text).astype("string")
+
+    def classify(self, merged: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(keep_mask, open_set_mask)``, positionally aligned with ``merged``."""
+        length = len(merged)
+        if self.open_set:
+            open_mask = merged.isin(self.open_set).to_numpy(dtype=bool, na_value=False)
+        else:
+            open_mask = np.zeros(length, dtype=bool)
+        if self.keep_only is None:
+            keep_mask = np.ones(length, dtype=bool)
+        else:
+            keep_mask = merged.isin(self.keep_only).to_numpy(dtype=bool, na_value=False)
+        return (keep_mask | open_mask), open_mask
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "merge_map": dict(sorted(self.merge_map.items())),
+            "keep_only": sorted(self.keep_only) if self.keep_only is not None else None,
+            "open_set_labels": sorted(self.open_set),
+        }
+
+
+def build_label_policy(config: Mapping[str, Any]) -> LabelPolicy:
+    labels_cfg = config.get("labels") or {}
+    unknown = set(labels_cfg).difference({"merge_map", "keep_only", "open_set_labels"})
+    if unknown:
+        raise ValueError(f"Unknown keys in the labels configuration block: {sorted(unknown)}")
+    return LabelPolicy(
+        labels_cfg.get("merge_map"),
+        labels_cfg.get("keep_only"),
+        labels_cfg.get("open_set_labels"),
+    )
+
+
+def validate_split_strategy(strategy: str) -> str:
+    if strategy not in SUPPORTED_SPLIT_STRATEGIES:
+        raise ValueError(
+            f"Unsupported split.strategy {strategy!r}; expected one of "
+            f"{list(SUPPORTED_SPLIT_STRATEGIES)}"
+        )
+    return strategy
+
+
+def resolve_capture_day_column(columns: Sequence[str], configured: str) -> str:
+    folded = {str(column).casefold(): str(column) for column in columns}
+    found = folded.get(str(configured).casefold())
+    if found is None:
+        raise ValueError(
+            f"split.strategy='by_capture_day' needs the column {configured!r}, which is not "
+            "present in every source Parquet schema"
+        )
+    return found
+
+
+def validate_capture_day_assignment(assignment: Mapping[str, str]) -> dict[str, str]:
+    if not assignment:
+        raise ValueError("split.capture_day_assignment must not be empty")
+    resolved = {str(day).strip(): str(role).strip() for day, role in assignment.items()}
+    invalid = {day: role for day, role in resolved.items() if role not in CAPTURE_DAY_ROLES}
+    if invalid:
+        raise ValueError(
+            f"split.capture_day_assignment roles must be one of {list(CAPTURE_DAY_ROLES)}; "
+            f"got {invalid}"
+        )
+    if CAPTURE_DAY_TRAIN_ROLE not in resolved.values():
+        raise ValueError(
+            "split.capture_day_assignment must give at least one day the "
+            f"{CAPTURE_DAY_TRAIN_ROLE!r} role"
+        )
+    return resolved
+
+
+def capture_day_split_codes(
+    days: pd.Series,
+    identities: np.ndarray,
+    assignment: Mapping[str, str],
+    validation_fraction: float,
+    seed: int,
+) -> np.ndarray:
+    """Assign train/validation inside the training day and send the held-out day to test.
+
+    Rows on a day with no configured role get :data:`UNASSIGNED_SPLIT_CODE` and are
+    dropped, which is what lets the open-set experiment train on one day's classes while
+    admitting a single unseen class from the other day.
+    """
+    fraction = float(validation_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("split.validation_fraction_of_train_day must lie strictly between 0 and 1")
+    roles = days.astype("string").str.strip().map(assignment).to_numpy(dtype=object)
+    codes = np.full(len(days), UNASSIGNED_SPLIT_CODE, dtype=np.int8)
+    codes[roles == CAPTURE_DAY_TEST_ROLE] = SPLIT_NAMES.index("test")
+    train_mask = roles == CAPTURE_DAY_TRAIN_ROLE
+    if train_mask.any():
+        within_day = split_codes_from_hashes(identities, [1.0 - fraction, fraction, 0.0], seed)
+        codes[train_mask] = within_day[train_mask]
+    return codes
+
+
+def closed_class_coverage(
+    labels_seen: set[str],
+    split_counts: Mapping[str, Mapping[str, int]],
+    open_set_only_splits: Sequence[str],
+) -> dict[str, list[str]]:
+    """Which trainable classes are absent from each split.
+
+    A split holding nothing but open-set rows -- the whole point of the open-set
+    experiment -- is exempt: it is *supposed* to contain none of the trained classes.
+    """
+    exempt = set(open_set_only_splits)
+    return {
+        split: ([] if split in exempt else sorted(labels_seen.difference(split_counts[split])))
+        for split in SPLIT_NAMES
+    }
 
 
 class ExactLeakageAuditor:
@@ -536,6 +715,55 @@ def enforce_leakage_audit(
             raise ValueError(f"Detected {overlap} groups in multiple splits")
 
 
+def split_identity_hashes(
+    frame: pd.DataFrame,
+    group_columns: Sequence[str],
+    group_aware: bool,
+    file_id: int,
+    row_ids: np.ndarray,
+) -> np.ndarray:
+    """The per-row identity a split code is derived from: the flow group, or the row itself."""
+    if group_aware:
+        return group_hashes(frame, group_columns)
+    return row_ids.astype(np.uint64, copy=False) ^ np.uint64(file_id)
+
+
+def assign_split_codes(
+    frame: pd.DataFrame,
+    *,
+    strategy: str,
+    identities: np.ndarray,
+    file_id: int,
+    row_ids: np.ndarray,
+    ratios: Sequence[float],
+    seed: int,
+    group_aware: bool,
+    capture_day_column: str | None,
+    capture_day_assignment: Mapping[str, str] | None,
+    validation_fraction: float,
+    open_set_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """One split code per row, for every supported strategy.
+
+    Open-set rows are forced into the test split last, so they survive a capture day that
+    the assignment deliberately leaves unclaimed.
+    """
+    if strategy == "by_capture_day":
+        if capture_day_column is None or capture_day_assignment is None:
+            raise ValueError("by_capture_day requires a resolved capture-day column and assignment")
+        codes = capture_day_split_codes(
+            frame[capture_day_column], identities, capture_day_assignment, validation_fraction, seed
+        )
+    elif group_aware:
+        codes = split_codes_from_hashes(identities, ratios, seed)
+    else:
+        codes = assign_row_split_codes(file_id, row_ids, ratios, seed)
+    if open_set_mask is not None and open_set_mask.any():
+        codes = codes.astype(np.int8, copy=True)
+        codes[open_set_mask] = SPLIT_NAMES.index("test")
+    return codes
+
+
 def preflight_split_coverage(
     files: Sequence[Path],
     root: Path,
@@ -546,19 +774,30 @@ def preflight_split_coverage(
     dataset_cfg: Mapping[str, Any],
     split_cfg: Mapping[str, Any],
     sampling_seed: int,
+    label_policy: LabelPolicy,
+    strategy: str,
+    capture_day_column: str | None = None,
+    capture_day_assignment: Mapping[str, str] | None = None,
     deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Derive the label-by-split matrix from identifier columns only, before any heavy work.
 
     The full-dataset preparation costs hours, and the "every class appears in every split"
     requirement could previously only fail on the very last statement of that work. Split
-    codes depend on nothing but the label, group and identity columns, so the same verdict is
-    reachable from a narrow read of two to six columns in a few minutes.
+    codes depend on nothing but the label, group, capture-day and identity columns, so the
+    same verdict is reachable from a narrow read of two to seven columns in a few minutes.
     """
     ratios = [float(split_cfg[name]) for name in SPLIT_NAMES]
     seed = int(split_cfg["seed"])
+    validation_fraction = float(split_cfg.get("validation_fraction_of_train_day", 0.15))
     needed = [column for column in ([target] if target else []) + list(group_columns) if column]
+    if strategy == "by_capture_day" and capture_day_column and capture_day_column not in needed:
+        needed.append(capture_day_column)
     counts = {split: Counter() for split in SPLIT_NAMES}
+    open_set_counts = {split: Counter() for split in SPLIT_NAMES}
+    excluded_by_label = Counter()
+    excluded_by_split = 0
+    rows_read = 0
     for path in files:
         relative = path.relative_to(root).as_posix()
         file_id = source_file_id(relative)
@@ -585,32 +824,84 @@ def preflight_split_coverage(
                 positions = (selected_in_group - np.uint64(offset)).astype(np.int64, copy=False)
                 frame = frame.iloc[positions].copy()
                 row_ids = selected_in_group
-            labels = (
-                pd.Series([path.stem] * len(frame), dtype="string")
+            rows_read += len(frame)
+            raw_labels = (
+                pd.Series([path.stem] * len(frame), dtype="string", index=frame.index)
                 if target is None
                 else frame[target].map(_canonical_label).astype("string")
             )
-            if group_aware:
-                codes = split_codes_from_hashes(group_hashes(frame, group_columns), ratios, seed)
-            else:
-                codes = assign_row_split_codes(file_id, row_ids, ratios, seed)
+            labels = label_policy.merge(raw_labels)
+            keep_mask, open_mask = label_policy.classify(labels)
+            if not keep_mask.all():
+                dropped = labels.iloc[np.flatnonzero(~keep_mask)].astype(str)
+                excluded_by_label.update(dropped.tolist())
+                kept = np.flatnonzero(keep_mask)
+                frame = frame.iloc[kept]
+                labels = labels.iloc[kept]
+                row_ids = row_ids[kept]
+                open_mask = open_mask[kept]
+            if not len(frame):
+                continue
+            identities = split_identity_hashes(frame, group_columns, group_aware, file_id, row_ids)
+            codes = assign_split_codes(
+                frame,
+                strategy=strategy,
+                identities=identities,
+                file_id=file_id,
+                row_ids=row_ids,
+                ratios=ratios,
+                seed=seed,
+                group_aware=group_aware,
+                capture_day_column=capture_day_column,
+                capture_day_assignment=capture_day_assignment,
+                validation_fraction=validation_fraction,
+                open_set_mask=open_mask,
+            )
+            excluded_by_split += int(np.count_nonzero(codes < 0))
             for code, split in enumerate(SPLIT_NAMES):
                 positions = np.flatnonzero(codes == code)
-                if len(positions):
-                    counts[split].update(labels.iloc[positions].astype(str).tolist())
-            del frame, labels, codes, row_ids
+                if not len(positions):
+                    continue
+                names = labels.iloc[positions].astype(str)
+                is_open = open_mask[positions]
+                closed_positions = np.flatnonzero(~is_open)
+                if len(closed_positions):
+                    counts[split].update(names.iloc[closed_positions].tolist())
+                open_positions = np.flatnonzero(is_open)
+                if len(open_positions):
+                    open_set_counts[split].update(names.iloc[open_positions].tolist())
+            del frame, labels, codes, row_ids, identities
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             raise PreprocessingPauseRequested(
                 "Session deadline reached during the split-coverage pre-flight; it restarts from "
                 "the beginning next session and costs only a narrow column read"
             )
     labels_seen = set().union(*(set(counter) for counter in counts.values())) if counts else set()
-    missing = {split: sorted(labels_seen.difference(counts[split])) for split in SPLIT_NAMES}
+    sizes = {
+        split: int(sum(counts[split].values()) + sum(open_set_counts[split].values()))
+        for split in SPLIT_NAMES
+    }
+    open_only = [
+        split for split in SPLIT_NAMES
+        if sizes[split] > 0 and not sum(counts[split].values())
+    ]
     return {
         "labels_seen": sorted(labels_seen),
+        "open_set_labels_seen": sorted(
+            set().union(*(set(counter) for counter in open_set_counts.values()))
+            if open_set_counts else set()
+        ),
         "class_counts": {split: dict(sorted(counts[split].items())) for split in SPLIT_NAMES},
-        "sizes": {split: int(sum(counts[split].values())) for split in SPLIT_NAMES},
-        "classes_missing_from_split": missing,
+        "open_set_counts": {
+            split: dict(sorted(open_set_counts[split].items())) for split in SPLIT_NAMES
+        },
+        "sizes": sizes,
+        "open_set_only_splits": open_only,
+        "classes_missing_from_split": closed_class_coverage(labels_seen, counts, open_only),
+        "rows_read": rows_read,
+        "rows_excluded_by_label_policy": int(sum(excluded_by_label.values())),
+        "excluded_label_counts": dict(sorted(excluded_by_label.items())),
+        "rows_excluded_by_unassigned_split": excluded_by_split,
         "columns_read": needed,
     }
 
@@ -938,9 +1229,23 @@ def prepare_dataset(
     if target is None and not dataset_cfg.get("label_from_filename_if_missing", False):
         raise ValueError("No target column found and filename-derived labels are disabled")
     group_columns = select_group_columns(common_columns, dataset_cfg.get("group_column_candidates", []))
-    if split_cfg.get("strategy") == "group_aware" and not group_columns:
+    strategy = validate_split_strategy(str(split_cfg.get("strategy", "auto_group_aware")))
+    if strategy == "group_aware" and not group_columns:
         raise ValueError("group_aware split was required but no configured group columns were found")
-    group_aware = bool(group_columns) and split_cfg.get("strategy") in {"group_aware", "auto_group_aware"}
+    # by_capture_day still hashes flows, but only to carve validation out of the training
+    # day; the train/test boundary is the capture day itself.
+    group_aware = bool(group_columns) and strategy in {"group_aware", "auto_group_aware", "by_capture_day"}
+    label_policy = build_label_policy(config)
+    capture_day_column: str | None = None
+    capture_day_assignment: dict[str, str] | None = None
+    validation_fraction = float(split_cfg.get("validation_fraction_of_train_day", 0.15))
+    if strategy == "by_capture_day":
+        capture_day_column = resolve_capture_day_column(
+            common_columns, str(split_cfg.get("capture_day_column", DEFAULT_CAPTURE_DAY_COLUMN))
+        )
+        capture_day_assignment = validate_capture_day_assignment(
+            split_cfg.get("capture_day_assignment") or {}
+        )
     features, drop_reasons, arrow_types = _drop_reasons(
         common_columns, target, group_columns, schemas[0], config["preprocessing"]
     )
@@ -990,7 +1295,8 @@ def prepare_dataset(
         )
         preflight = preflight_split_coverage(
             files, root, target, group_columns, group_aware, sampling_plan,
-            dataset_cfg, split_cfg, sampling_seed, deadline_monotonic,
+            dataset_cfg, split_cfg, sampling_seed, label_policy, strategy,
+            capture_day_column, capture_day_assignment, deadline_monotonic,
         )
         preflight["fingerprint"] = fingerprint
         preflight["split_algorithm_version"] = SPLIT_ALGORITHM_VERSION
@@ -1015,6 +1321,9 @@ def prepare_dataset(
 
     ratios = [float(split_cfg[name]) for name in SPLIT_NAMES]
     labels_seen: set[str] = set(progress.get("labels_seen", [])) if progress else set()
+    open_set_labels_seen: set[str] = set((progress or {}).get("open_set_labels_seen", []))
+    excluded_label_counts = Counter((progress or {}).get("excluded_label_counts", {}))
+    rows_excluded_by_split = int((progress or {}).get("rows_excluded_by_unassigned_split", 0))
     split_counts = {
         name: Counter((progress or {}).get("split_counts", {}).get(name, {})) for name in SPLIT_NAMES
     }
@@ -1043,6 +1352,10 @@ def prepare_dataset(
         )
     samples_per_file = dataset_cfg.get("samples_per_file")
     target_total_rows = dataset_cfg.get("target_total_rows")
+    # Which splits participate in group-level leakage auditing. Under by_capture_day the
+    # test split is a different capture day, where a repeated flow 5-tuple is a property of
+    # the network rather than a leak, so only the intra-day train/validation boundary counts.
+    audit_group_splits = ("train", "validation") if strategy == "by_capture_day" else None
     if preprocessing_store is not None:
         preprocessing_store.set_active("preparing", len(completed_files), len(files))
     try:
@@ -1058,7 +1371,8 @@ def prepare_dataset(
                 sampled_row_ids = deterministic_sample_row_ids(
                     file_id, physical_rows, int(sampling_plan[relative]), sampling_seed
                 )
-            rows_processed = 0
+            rows_read = 0
+            rows_written = 0
             for frame, offset in _iter_file_chunks(path, selected_rows):
                 row_ids = np.arange(offset, offset + len(frame), dtype=np.uint64)
                 if sampled_row_ids is not None:
@@ -1071,17 +1385,49 @@ def prepare_dataset(
                     positions = (selected_in_group - np.uint64(offset)).astype(np.int64, copy=False)
                     frame = frame.iloc[positions].copy()
                     row_ids = selected_in_group
+                rows_read += len(frame)
                 if target is None:
-                    labels = pd.Series([path.stem] * len(frame), dtype="string")
+                    raw_labels = pd.Series(
+                        [path.stem] * len(frame), dtype="string", index=frame.index
+                    )
                 else:
-                    labels = frame[target].map(_canonical_label).astype("string")
-                labels_seen.update(labels.unique().tolist())
-                if group_aware:
-                    hashes = group_hashes(frame, group_columns)
-                    codes = split_codes_from_hashes(hashes, ratios, int(split_cfg["seed"]))
-                else:
-                    hashes = np.empty(0, dtype=np.uint64)
-                    codes = assign_row_split_codes(file_id, row_ids, ratios, int(split_cfg["seed"]))
+                    raw_labels = frame[target].map(_canonical_label).astype("string")
+                labels = label_policy.merge(raw_labels)
+                keep_mask, open_mask = label_policy.classify(labels)
+                if not keep_mask.all():
+                    excluded_label_counts.update(
+                        labels.iloc[np.flatnonzero(~keep_mask)].astype(str).tolist()
+                    )
+                    kept = np.flatnonzero(keep_mask)
+                    frame = frame.iloc[kept]
+                    labels = labels.iloc[kept]
+                    row_ids = row_ids[kept]
+                    open_mask = open_mask[kept]
+                if not len(frame):
+                    del frame, raw_labels, labels, row_ids
+                    continue
+                closed_positions = np.flatnonzero(~open_mask)
+                labels_seen.update(labels.iloc[closed_positions].astype(str).unique().tolist())
+                if open_mask.any():
+                    open_set_labels_seen.update(
+                        labels.iloc[np.flatnonzero(open_mask)].astype(str).unique().tolist()
+                    )
+                hashes = split_identity_hashes(frame, group_columns, group_aware, file_id, row_ids)
+                codes = assign_split_codes(
+                    frame,
+                    strategy=strategy,
+                    identities=hashes,
+                    file_id=file_id,
+                    row_ids=row_ids,
+                    ratios=ratios,
+                    seed=int(split_cfg["seed"]),
+                    group_aware=group_aware,
+                    capture_day_column=capture_day_column,
+                    capture_day_assignment=capture_day_assignment,
+                    validation_fraction=validation_fraction,
+                    open_set_mask=open_mask,
+                )
+                rows_excluded_by_split += int(np.count_nonzero(codes < 0))
                 numeric = pd.DataFrame(index=frame.index)
                 for feature in features:
                     values = pd.to_numeric(frame[feature], errors="coerce").to_numpy(dtype=np.float64, copy=True)
@@ -1095,24 +1441,32 @@ def prepare_dataset(
                     if not len(positions):
                         continue
                     auditor.add_samples(file_id, row_ids[positions], code)
-                    if group_aware:
+                    # Under by_capture_day a flow 5-tuple may legitimately recur on the other
+                    # capture day, so train-vs-test group overlap is expected rather than
+                    # leakage. Only the train/validation boundary, which is carved inside one
+                    # day, is a real group-leakage risk and therefore the only one audited.
+                    if group_aware and (audit_group_splits is None or split in audit_group_splits):
                         auditor.add_groups(hashes[positions], code)
                     selected_labels = labels.iloc[positions].astype(str)
                     split_counts[split].update(selected_labels.tolist())
                     writer.append(split, numeric.iloc[positions].reset_index(drop=True))
-                rows_processed += len(frame)
-                del frame, labels, row_ids, hashes, codes, numeric
+                    rows_written += len(positions)
+                del frame, raw_labels, labels, row_ids, hashes, codes, numeric
                 gc.collect()
             source_inventory.append({
                 "path": relative,
                 "source_file_id_hex": f"{file_id:016x}",
                 "physical_rows": physical_rows,
                 "planned_sample_rows": int(sampling_plan[relative]),
-                "rows_processed": rows_processed,
+                "rows_read": rows_read,
+                "rows_written": rows_written,
+                # Retained under its original name so older manifests stay comparable; with no
+                # label policy configured it is still every row the sampler selected.
+                "rows_processed": rows_written,
             })
-            if rows_processed != int(sampling_plan[relative]):
+            if rows_read != int(sampling_plan[relative]):
                 raise RuntimeError(
-                    f"Sampling count mismatch for {relative}: {rows_processed} != {sampling_plan[relative]}"
+                    f"Sampling count mismatch for {relative}: {rows_read} != {sampling_plan[relative]}"
                 )
             writer.flush_all()
             auditor.flush()
@@ -1123,6 +1477,9 @@ def prepare_dataset(
                 "fingerprint": fingerprint,
                 "completed_files": sorted(completed_files),
                 "labels_seen": sorted(labels_seen),
+                "open_set_labels_seen": sorted(open_set_labels_seen),
+                "excluded_label_counts": dict(sorted(excluded_label_counts.items())),
+                "rows_excluded_by_unassigned_split": rows_excluded_by_split,
                 "split_counts": {
                     split: dict(sorted(split_counts[split].items())) for split in SPLIT_NAMES
                 },
@@ -1146,13 +1503,30 @@ def prepare_dataset(
     finally:
         auditor.close()
 
+    # Open-set classes are deliberately absent from the mapping: the model must have no
+    # output unit for them. Their rows survive in the test split encoded as
+    # OPEN_SET_LABEL_CODE, which the report recognises and scores separately.
+    overlap = sorted(labels_seen & open_set_labels_seen)
+    if overlap:
+        raise ValueError(
+            f"Labels {overlap} were seen both as trainable and as open-set; check labels.keep_only"
+        )
     label_mapping = {label: index for index, label in enumerate(sorted(labels_seen))}
     atomic_json_dump(label_mapping, destination / "label_mapping.json")
+    if open_set_labels_seen:
+        atomic_json_dump(
+            {label: OPEN_SET_LABEL_CODE for label in sorted(open_set_labels_seen)},
+            destination / "open_set_labels.json",
+        )
     for split in SPLIT_NAMES:
         for part in writer.parts[split]:
             path = destination / part["path"]
             frame = pd.read_parquet(path)
-            frame[ENCODED_LABEL_COLUMN] = frame.pop("_label_name").map(label_mapping).astype(np.int32)
+            encoded = frame.pop("_label_name").map(label_mapping)
+            if encoded.isna().any():
+                frame[ENCODED_LABEL_COLUMN] = encoded.fillna(OPEN_SET_LABEL_CODE).astype(np.int32)
+            else:
+                frame[ENCODED_LABEL_COLUMN] = encoded.astype(np.int32)
             temporary = path.with_suffix(path.suffix + ".tmp")
             frame.to_parquet(temporary, index=False, compression=config["output"]["compression"])
             os.replace(temporary, path)
@@ -1163,15 +1537,29 @@ def prepare_dataset(
 
     # Plain asserts vanish under `python -O`; these are data-integrity gates, not debug aids.
     split_sizes = {split: int(sum(split_counts[split].values())) for split in SPLIT_NAMES}
-    processed = sum(item["rows_processed"] for item in source_inventory)
-    if sum(split_sizes.values()) != processed:
+    written = sum(item["rows_written"] for item in source_inventory)
+    rows_read_total = sum(item["rows_read"] for item in source_inventory)
+    if sum(split_sizes.values()) != written:
         raise ValueError(
-            f"Split sizes {split_sizes} do not account for {processed} processed rows"
+            f"Split sizes {split_sizes} do not account for {written} written rows"
+        )
+    excluded_total = int(sum(excluded_label_counts.values())) + rows_excluded_by_split
+    if rows_read_total - excluded_total != written:
+        raise ValueError(
+            f"Row accounting does not balance: read={rows_read_total}, excluded={excluded_total}, "
+            f"written={written}"
         )
     empty_splits = {split: size for split, size in split_sizes.items() if size <= 0}
     if empty_splits:
         raise ValueError(f"Empty split detected: {split_sizes}")
-    missing = {split: sorted(labels_seen.difference(split_counts[split])) for split in SPLIT_NAMES}
+    # A split holding only open-set rows has no trainable class by construction; it is the
+    # point of the open-set experiment, not a coverage failure.
+    open_set_only_splits = [
+        split for split in SPLIT_NAMES
+        if split_sizes[split] > 0
+        and not any(label in labels_seen for label in split_counts[split])
+    ]
+    missing = closed_class_coverage(labels_seen, split_counts, open_set_only_splits)
     if split_cfg.get("require_all_classes_each_split", True) and any(missing.values()):
         raise ValueError(f"Classes missing from one or more splits: {missing}")
     if preflight["classes_missing_from_split"] != missing:
@@ -1195,6 +1583,10 @@ def prepare_dataset(
         "feature_selection": "none",
         "imbalance_handling": "none",
         "label_mapping_file": "label_mapping.json",
+        "label_policy": label_policy.describe(),
+        "open_set_labels": sorted(open_set_labels_seen),
+        "rows_excluded_by_label_policy": int(sum(excluded_label_counts.values())),
+        "excluded_label_counts": dict(sorted(excluded_label_counts.items())),
     }
     atomic_json_dump(preprocessing, destination / "preprocessing.json")
     manifest = {
@@ -1215,6 +1607,7 @@ def prepare_dataset(
             if target_total_rows is not None else None
         ),
         "class_rebalancing": "none",
+        "label_policy": label_policy.describe(),
         "source_files": source_inventory,
         "sample_id_definition": {
             "fields": [GENERATED_SAMPLE_FILE_COLUMN, GENERATED_SAMPLE_ROW_COLUMN],
@@ -1222,12 +1615,34 @@ def prepare_dataset(
             "row_id": "zero-based physical row number in the source Parquet file",
         },
         "split": {
-            "method": "deterministic group hash" if group_aware else "deterministic sample-ID hash stratified by label source",
+            "strategy": strategy,
+            "method": (
+                "held-out capture day for test; deterministic group hash for train/validation"
+                if strategy == "by_capture_day"
+                else (
+                    "deterministic group hash" if group_aware
+                    else "deterministic sample-ID hash stratified by label source"
+                )
+            ),
             "group_aware": group_aware,
             "group_columns": group_columns,
+            "group_audit_scope": list(audit_group_splits) if audit_group_splits else list(SPLIT_NAMES),
+            "capture_day_column": capture_day_column,
+            "capture_day_assignment": capture_day_assignment,
+            "validation_fraction_of_train_day": (
+                validation_fraction if strategy == "by_capture_day" else None
+            ),
             "seed": int(split_cfg["seed"]),
-            "ratios": {name: float(split_cfg[name]) for name in SPLIT_NAMES},
+            "ratios": (
+                {name: float(split_cfg[name]) for name in SPLIT_NAMES}
+                if strategy != "by_capture_day" else None
+            ),
             "sizes": split_sizes,
+            "open_set_only_splits": open_set_only_splits,
+            "open_set_labels": sorted(open_set_labels_seen),
+            "rows_read": rows_read_total,
+            "rows_excluded_by_label_policy": int(sum(excluded_label_counts.values())),
+            "rows_excluded_by_unassigned_split": rows_excluded_by_split,
             "class_counts": {split: dict(sorted(split_counts[split].items())) for split in SPLIT_NAMES},
             "classes_missing_from_split": missing,
             "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
@@ -1255,12 +1670,17 @@ def prepare_dataset(
             destination / "split_coverage_preflight.json",
         ):
             preprocessing_store.upload_artifact(path)
+        if open_set_labels_seen:
+            preprocessing_store.upload_artifact(destination / "open_set_labels.json")
         preprocessing_store.save_progress({
             "format_version": 1,
             "status": "complete",
             "fingerprint": fingerprint,
             "completed_files": sorted(completed_files),
             "labels_seen": sorted(labels_seen),
+            "open_set_labels_seen": sorted(open_set_labels_seen),
+            "excluded_label_counts": dict(sorted(excluded_label_counts.items())),
+            "rows_excluded_by_unassigned_split": rows_excluded_by_split,
             "split_counts": {split: dict(sorted(split_counts[split].items())) for split in SPLIT_NAMES},
             "source_inventory": source_inventory,
             "parts": {split: writer.parts[split] for split in SPLIT_NAMES},

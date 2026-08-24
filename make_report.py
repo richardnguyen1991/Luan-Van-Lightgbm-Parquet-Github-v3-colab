@@ -13,7 +13,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
@@ -34,7 +34,7 @@ from sklearn.metrics import (
 )
 
 from checkpoint import S3Store, atomic_json_dump, sha256_file
-from viz import generate_final_figures
+from viz import generate_final_figures, plot_open_set_distribution
 
 
 LOGGER = logging.getLogger("make_report")
@@ -159,10 +159,73 @@ def combine_callbacks(first: ArtifactCallback | None, second: ArtifactCallback |
     return combined
 
 
+OPEN_SET_LABEL_CODE = -1
+
+
+def open_set_prediction_report(
+    run_dir: Path,
+    y_prob: np.ndarray,
+    class_names: Sequence[str],
+    chunk_rows: int,
+    callback: ArtifactCallback | None = None,
+) -> tuple[dict[str, Any], list[Path]]:
+    """Where does the model send an attack family it was never trained on?
+
+    Experiment C holds out Portmap entirely, so the test rows carry no trainable label and
+    accuracy is undefined for them. What is defined -- and is the actual result -- is the
+    distribution the closed-set model forces those rows into, together with how confident
+    it is while doing so. A model that quietly assigns unseen traffic to one neighbouring
+    class with high confidence is a very different operational risk from one that spreads
+    its mass thinly, and only this table distinguishes them.
+    """
+    total = int(len(y_prob))
+    counts = np.zeros(len(class_names), dtype=np.int64)
+    confidence_sum = 0.0
+    entropy_sum = 0.0
+    for start in range(0, total, chunk_rows):
+        stop = min(start + chunk_rows, total)
+        block = np.asarray(y_prob[start:stop], dtype=np.float64)
+        predicted = block.argmax(axis=1)
+        counts += np.bincount(predicted, minlength=len(class_names))
+        confidence_sum += float(block.max(axis=1).sum())
+        entropy_sum += float(-(block * np.log(np.clip(block, 1e-12, None))).sum())
+        del block, predicted
+        gc.collect()
+    table = pd.DataFrame({
+        "predicted_class": list(class_names),
+        "rows": counts,
+        "share": counts / max(1, total),
+    }).sort_values("rows", ascending=False, ignore_index=True)
+    metrics_dir = run_dir / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    table_path = metrics_dir / "open_set_prediction_distribution.csv"
+    table.to_csv(table_path, index=False, float_format="%.6f")
+    notify(table_path, "metrics", callback)
+    summary = {
+        "open_set_rows": total,
+        "mean_max_probability": confidence_sum / max(1, total),
+        "mean_predictive_entropy": entropy_sum / max(1, total),
+        "maximum_entropy_for_reference": float(np.log(len(class_names))),
+        "dominant_predicted_class": str(table.loc[0, "predicted_class"]),
+        "dominant_predicted_share": float(table.loc[0, "share"]),
+        "distribution": {
+            str(row.predicted_class): int(row.rows) for row in table.itertuples(index=False)
+        },
+    }
+    figures = plot_open_set_distribution(run_dir, table, callback)
+    return summary, [table_path, *figures]
+
+
 def stratified_indices(y_true: np.ndarray, num_classes: int, maximum: int, seed: int) -> np.ndarray:
     if len(y_true) <= maximum:
         return np.arange(len(y_true), dtype=np.int64)
-    counts = np.bincount(np.asarray(y_true, dtype=np.int64), minlength=num_classes)
+    labels = np.asarray(y_true, dtype=np.int64)
+    if np.all(labels == OPEN_SET_LABEL_CODE):
+        # Nothing to stratify over: every row belongs to the one class the model was never
+        # given an output unit for. A deterministic uniform sample is the honest fallback.
+        rng = np.random.default_rng(seed)
+        return np.sort(rng.choice(len(labels), size=int(maximum), replace=False)).astype(np.int64)
+    counts = np.bincount(labels, minlength=num_classes)
     raw = counts / counts.sum() * maximum
     quotas = np.floor(raw).astype(np.int64)
     quotas[(counts > 0) & (quotas == 0)] = 1
@@ -226,7 +289,12 @@ def create_prediction_artifacts(
     explain["_label"] = np.asarray(test_labels)[indices].astype(true_dtype)
     explain_path = raw_dir / "explain_sample.parquet"
     explain.to_parquet(explain_path, index=False, compression="zstd")
-    support = np.bincount(explain["_label"].to_numpy(dtype=np.int64), minlength=num_classes)
+    explain_labels = explain["_label"].to_numpy(dtype=np.int64)
+    support = (
+        np.zeros(num_classes, dtype=np.int64)
+        if np.all(explain_labels == OPEN_SET_LABEL_CODE)
+        else np.bincount(explain_labels, minlength=num_classes)
+    )
     manifest = {
         "source": "held-out test split",
         "sampling": "deterministic stratified sample preserving natural class proportions",
@@ -512,6 +580,18 @@ def generate_report(run_dir: Path, callback: ArtifactCallback | None = None) -> 
         raise TypeError("y_true must be int16/int32 and y_prob must be float32")
     if y_prob.shape != (len(y_true), len(class_names)):
         raise ValueError("Prediction arrays disagree with label_mapping.json")
+    open_mask = np.asarray(y_true) == OPEN_SET_LABEL_CODE
+    if open_mask.any() and not open_mask.all():
+        raise ValueError(
+            f"The test split mixes {int(open_mask.sum())} open-set rows with "
+            f"{int((~open_mask).sum())} labelled rows; the report scores one or the other, "
+            "not a blend. Prepare the open-set experiment with its own labels.keep_only."
+        )
+    if open_mask.all():
+        return _generate_open_set_report(
+            run_dir, run_config, run_config_path, history, class_names, booster, model_path,
+            y_prob, report_config, callback,
+        )
     y_pred, confusion = cumulative_predictions(y_true, y_prob, len(class_names), int(report_config["prediction_chunk_rows"]))
     precision, recall, f1, support = precision_recall_fscore_support(
         y_true, y_pred, labels=labels_order, zero_division=0
@@ -542,6 +622,10 @@ def generate_report(run_dir: Path, callback: ArtifactCallback | None = None) -> 
         gc.collect()
     training_seconds = float(sum(float(item["iteration_seconds"]) for item in history))
     test_metrics = {
+        # Ordered so the two headline figures come first: on this class distribution they
+        # are the ones that mean anything.
+        "primary_metrics": ["macro_f1", "balanced_accuracy"],
+        "secondary_metrics": ["accuracy", "weighted_f1"],
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "macro_precision": float(precision_score(y_true, y_pred, labels=labels_order, average="macro", zero_division=0)),
@@ -569,11 +653,14 @@ def generate_report(run_dir: Path, callback: ArtifactCallback | None = None) -> 
     test_metrics_path = metrics_dir / "test_metrics.json"
     atomic_json_dump(test_metrics, test_metrics_path)
     notify(test_metrics_path, "metrics", callback)
+    # Macro F1 and balanced accuracy lead the table. TFTP alone is 28.5% of the corpus, so
+    # plain accuracy is close to uninformative and is demoted to a secondary column.
     summary = {
-        "Accuracy": test_metrics["accuracy"], "Balanced Accuracy": test_metrics["balanced_accuracy"],
+        "Macro F1": test_metrics["macro_f1"], "Balanced Accuracy": test_metrics["balanced_accuracy"],
         "Macro Precision": test_metrics["macro_precision"], "Macro Recall": test_metrics["macro_recall"],
-        "Macro F1": test_metrics["macro_f1"], "Weighted F1": test_metrics["weighted_f1"],
-        "MCC": test_metrics["mcc"], "Minority Class": test_metrics["minority_class"],
+        "MCC": test_metrics["mcc"], "Weighted F1": test_metrics["weighted_f1"],
+        "Accuracy": test_metrics["accuracy"],
+        "Minority Class": test_metrics["minority_class"],
         "Minority Class F1": test_metrics["minority_class_f1"], "Log Loss": test_metrics["log_loss"],
         "AUC-ROC macro-OVR": test_metrics["auc_roc_macro_ovr"],
         "AUC-ROC weighted-OVR": test_metrics["auc_roc_weighted_ovr"], "AUC-ROC micro": test_metrics["auc_roc_micro"],
@@ -616,6 +703,75 @@ def generate_report(run_dir: Path, callback: ArtifactCallback | None = None) -> 
     del y_true_plot, y_prob_plot, plot_indices, y_pred, confusion, y_true, y_prob
     gc.collect()
     return [per_class_path, report_path, test_metrics_path, summary_path, run_config_path, *figures]
+
+
+def _generate_open_set_report(
+    run_dir: Path,
+    run_config: dict[str, Any],
+    run_config_path: Path,
+    history: Sequence[Mapping[str, Any]],
+    class_names: Sequence[str],
+    booster: Any,
+    model_path: Path,
+    y_prob: np.ndarray,
+    report_config: Mapping[str, Any],
+    callback: ArtifactCallback | None,
+) -> list[Path]:
+    """The Experiment C report: no accuracy, because there is no reachable right answer.
+
+    Every test row belongs to a class held out of training, so precision, recall, ROC and
+    the confusion matrix are all undefined. What the run does produce is the distribution
+    the model forces those rows into and how confident it is -- which is the finding.
+    """
+    metrics_dir = run_dir / "metrics"
+    summary, artifacts = open_set_prediction_report(
+        run_dir, y_prob, class_names, int(report_config["prediction_chunk_rows"]), callback
+    )
+    training_seconds = float(sum(float(item["iteration_seconds"]) for item in history))
+    metrics = {
+        "evaluation_mode": "open_set",
+        "reason": (
+            "every test row carries a class withheld from training, so closed-set metrics "
+            "are undefined"
+        ),
+        "open_set": summary,
+        "final_iteration": 100,
+        "num_trees": int(booster.num_trees()),
+        "model_size_mb": model_path.stat().st_size / 1024**2,
+        "training_time_seconds": training_seconds,
+        "test_samples": int(len(y_prob)),
+    }
+    metrics_path = metrics_dir / "test_metrics.json"
+    atomic_json_dump(metrics, metrics_path)
+    notify(metrics_path, "metrics", callback)
+    summary_path = metrics_dir / "summary_metrics.csv"
+    pd.DataFrame([{
+        "evaluation_mode": "open_set",
+        "open_set_rows": summary["open_set_rows"],
+        "dominant_predicted_class": summary["dominant_predicted_class"],
+        "dominant_predicted_share": summary["dominant_predicted_share"],
+        "mean_max_probability": summary["mean_max_probability"],
+        "mean_predictive_entropy": summary["mean_predictive_entropy"],
+        "maximum_entropy_for_reference": summary["maximum_entropy_for_reference"],
+        "final_iteration": 100,
+        "num_trees": metrics["num_trees"],
+        "model_size_mb": metrics["model_size_mb"],
+        "training_time_seconds": training_seconds,
+    }]).to_csv(summary_path, index=False, float_format="%.6f")
+    notify(summary_path, "metrics", callback)
+    run_config["plotting"] = {
+        "evaluation_mode": "open_set",
+        "roc_pr_samples_used": 0,
+        "metrics_use_full_test": True,
+    }
+    atomic_json_dump(run_config, run_config_path)
+    notify(run_config_path, "config", callback)
+    LOGGER.info(
+        "Open-set evaluation: %d unseen rows, %.1f%% assigned to %s, mean confidence %.3f",
+        summary["open_set_rows"], 100 * summary["dominant_predicted_share"],
+        summary["dominant_predicted_class"], summary["mean_max_probability"],
+    )
+    return [metrics_path, summary_path, run_config_path, *artifacts]
 
 
 def evaluate_final_model(

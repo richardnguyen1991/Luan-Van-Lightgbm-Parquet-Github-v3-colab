@@ -19,7 +19,7 @@ from model import (  # noqa: E402
     TrainingPauseRequested,
     build_datasets,
     continue_training,
-    macro_f1_metric,
+    multiclass_macro_metrics,
     raw_init_score,
 )
 
@@ -221,7 +221,7 @@ class LightGBMResumeIntegrationTest(unittest.TestCase):
                 num_boost_round=target_iteration,
                 valid_sets=[train_set, validation_set],
                 valid_names=["train", "validation"],
-                feval=macro_f1_metric(3),
+                feval=multiclass_macro_metrics(3),
                 keep_training_booster=True,
                 callbacks=[first],
             )
@@ -239,7 +239,7 @@ class LightGBMResumeIntegrationTest(unittest.TestCase):
             num_boost_round=target_iteration - 20,
             valid_sets=[train_set, validation_set],
             valid_names=["train", "validation"],
-            feval=macro_f1_metric(3),
+            feval=multiclass_macro_metrics(3),
             init_model=resumed_model,
             keep_training_booster=True,
             callbacks=[second],

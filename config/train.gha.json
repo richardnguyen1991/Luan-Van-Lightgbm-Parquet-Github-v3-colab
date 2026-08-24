@@ -46,6 +46,13 @@
   "dataset": {
     "prepared_data_dir": "outputs/data",
     "require_full_dataset_manifest": true,
+    "monitor_split": {
+      "enabled": false,
+      "split": "test",
+      "name": "crossday",
+      "maximum_rows": 2000000,
+      "seed": 2026
+    },
     "feature_screening": {
       "maximum_features": 20,
       "balanced_train_rows": 500000,

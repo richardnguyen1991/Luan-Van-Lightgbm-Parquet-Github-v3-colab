@@ -18,7 +18,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, recall_score
 
 from checkpoint import canonical_hash
 
@@ -26,6 +26,9 @@ from checkpoint import canonical_hash
 LOGGER = logging.getLogger(__name__)
 SPLIT_NAMES = ("train", "validation", "test")
 INTERNAL_COLUMNS = ("_sample_file_id", "_sample_row_id", "_label")
+# Mirrors data.OPEN_SET_LABEL_CODE: rows of a class deliberately withheld from training.
+OPEN_SET_LABEL_CODE = -1
+RESERVED_VALID_NAMES = frozenset({"train", "validation", "training"})
 
 
 class TrainingPauseRequested(RuntimeError):
@@ -43,6 +46,7 @@ def estimate_training_memory(
     params: Mapping[str, Any],
     available_bytes: int,
     available_fraction: float,
+    monitor_rows: int = 0,
 ) -> dict[str, Any]:
     """Project the resident set this run needs, per allocation, for the Sequence path.
 
@@ -55,7 +59,10 @@ def estimate_training_memory(
     """
     train_rows = int(split_sizes["train"])
     validation_rows = int(split_sizes["validation"])
-    scored_rows = train_rows + validation_rows
+    # A cross-day monitoring set is a third scored Dataset: it is binned, scored and
+    # predicted every round exactly like validation, so it belongs in every term below.
+    monitored_rows = max(0, int(monitor_rows))
+    scored_rows = train_rows + validation_rows + monitored_rows
     bytes_per_bin = 1 if int(params.get("max_bin", 255)) <= 255 else 2
 
     binned_dataset = scored_rows * num_features * bytes_per_bin
@@ -72,11 +79,18 @@ def estimate_training_memory(
     # its own array before ours can be released, so both exist at once.
     resume_init_scores = scored_rows * num_classes * 8 * 2
     resume_peak = binned_dataset + internal_scores + resume_init_scores
-    estimated_peak = max(steady_state, resume_peak)
+    # The monitoring subsample is materialised once as a dense float32 matrix before
+    # LightGBM bins it; that transient allocation coexists with the binned train Dataset.
+    monitor_materialization = monitored_rows * num_features * 4
+    construction_peak = (
+        train_rows + validation_rows
+    ) * num_features * bytes_per_bin + monitor_materialization
+    estimated_peak = max(steady_state, resume_peak, construction_peak)
     budget = int(available_bytes * float(available_fraction))
     return {
         "train_rows": train_rows,
         "validation_rows": validation_rows,
+        "monitor_rows": monitored_rows,
         "num_features": num_features,
         "num_classes": num_classes,
         "binned_dataset_bytes": int(binned_dataset),
@@ -87,6 +101,8 @@ def estimate_training_memory(
         "steady_state_bytes": int(steady_state),
         "resume_init_score_bytes": int(resume_init_scores),
         "resume_peak_bytes": int(resume_peak),
+        "monitor_materialization_bytes": int(monitor_materialization),
+        "construction_peak_bytes": int(construction_peak),
         "estimated_peak_bytes": int(estimated_peak),
         "available_bytes": int(available_bytes),
         "available_fraction": float(available_fraction),
@@ -170,6 +186,25 @@ def validate_training_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Configured metrics must be exactly multi_logloss and multi_error")
     if int(config["checkpoint"]["interval_rounds"]) != 10:
         raise ValueError("checkpoint.interval_rounds must be exactly 10")
+    monitor = config.get("dataset", {}).get("monitor_split")
+    if monitor is not None:
+        if not isinstance(monitor, Mapping):
+            raise ValueError("dataset.monitor_split must be an object")
+        unknown = set(monitor).difference({"enabled", "split", "name", "maximum_rows", "seed"})
+        if unknown:
+            raise ValueError(f"Unknown keys in dataset.monitor_split: {sorted(unknown)}")
+        if bool(monitor.get("enabled", False)):
+            if str(monitor.get("split", "test")) not in SPLIT_NAMES:
+                raise ValueError(f"dataset.monitor_split.split must be one of {list(SPLIT_NAMES)}")
+            name = str(monitor.get("name", "crossday"))
+            if name in RESERVED_VALID_NAMES:
+                raise ValueError(
+                    f"dataset.monitor_split.name must not shadow a built-in evaluation set: {name!r}"
+                )
+            if int(monitor.get("maximum_rows", 0)) <= 0:
+                raise ValueError("dataset.monitor_split.maximum_rows must be positive")
+            if not isinstance(monitor.get("seed"), int):
+                raise ValueError("dataset.monitor_split.seed must be an integer")
 
 
 def effective_model_params(config: Mapping[str, Any], num_classes: int) -> dict[str, Any]:
@@ -195,18 +230,27 @@ def validate_dataset_manifest(config: Mapping[str, Any], manifest: Mapping[str, 
     for item in source_files:
         physical = int(item["physical_rows"])
         planned = int(item["planned_sample_rows"])
-        processed = int(item["rows_processed"])
-        if physical != planned or physical != processed:
+        # "Full dataset" means every physical row was *read and classified*, not that every
+        # row was written: the cross-day and open-set experiments deliberately discard rows
+        # whose class or capture day is out of scope. Older manifests have no rows_read.
+        read = int(item.get("rows_read", item["rows_processed"]))
+        if physical != planned or physical != read:
             incomplete.append(str(item["path"]))
     if incomplete:
         raise ValueError(
-            "Production manifest does not use every physical row: " + ", ".join(incomplete[:10])
+            "Production manifest does not read every physical row: " + ", ".join(incomplete[:10])
         )
-    selected = sum(int(value) for value in manifest["split"]["sizes"].values())
+    written = sum(int(value) for value in manifest["split"]["sizes"].values())
     physical = sum(int(item["physical_rows"]) for item in source_files)
-    if selected != physical:
+    split = manifest["split"]
+    excluded = (
+        int(split.get("rows_excluded_by_label_policy", 0))
+        + int(split.get("rows_excluded_by_unassigned_split", 0))
+    )
+    if written + excluded != physical:
         raise ValueError(
-            f"Production manifest row count mismatch: selected={selected}, physical={physical}"
+            f"Production manifest row count mismatch: written={written}, excluded={excluded}, "
+            f"physical={physical}"
         )
 
 
@@ -224,6 +268,15 @@ class DatasetBundle:
     feature_schema_hash: str
     feature_selection: dict[str, Any]
     memory_estimate: dict[str, Any]
+    # Optional third evaluation set. Under the cross-capture-day experiment this is a
+    # stratified subsample of the held-out day, watched every round so the learning-curve
+    # figure can show the in-distribution and out-of-day curves side by side.
+    monitor_dataset: Any = None
+    monitor_features: Any = None
+    monitor_labels: np.ndarray | None = None
+    monitor_name: str | None = None
+    monitor_source_split: str | None = None
+    monitor_indices: np.ndarray | None = None
 
 
 class _ILocIndexer:
@@ -298,6 +351,89 @@ class LazyParquetFeatures:
         if as_frame:
             return pd.DataFrame(result, columns=self.output_feature_names)
         return result
+
+
+class RowSubsetFeatures:
+    """A row-index view over :class:`LazyParquetFeatures`, for a monitoring subsample.
+
+    Holding the subsample as indices rather than a materialised matrix keeps the resume
+    path lazy: init scores are recomputed chunk by chunk from Parquet instead of pinning
+    a multi-hundred-megabyte float32 array for the whole run.
+    """
+
+    def __init__(self, source: "LazyParquetFeatures", indices: np.ndarray) -> None:
+        self.source = source
+        self.indices = np.asarray(indices, dtype=np.int64)
+        if len(self.indices) and (
+            self.indices.min() < 0 or self.indices.max() >= len(source)
+        ):
+            raise IndexError("Monitoring subsample references rows outside the source split")
+        self.feature_names = list(source.feature_names)
+        self.output_feature_names = list(source.output_feature_names)
+        self.iloc = _ILocIndexer(self)
+
+    def __len__(self) -> int:
+        return int(len(self.indices))
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return len(self), len(self.feature_names)
+
+    def read(self, index: Any, as_frame: bool = False) -> Any:
+        if isinstance(index, slice):
+            positions = self.indices[index]
+        elif isinstance(index, (int, np.integer)):
+            positions = self.indices[int(index)]
+        else:
+            positions = self.indices[np.asarray(index, dtype=np.int64).reshape(-1)]
+        return self.source.read(positions, as_frame=as_frame)
+
+
+def stratified_monitor_indices(
+    labels: np.ndarray, maximum_rows: int, seed: int
+) -> np.ndarray:
+    """Deterministic, class-proportional row sample with at least one row per class.
+
+    The held-out capture day is tens of millions of rows; scoring all of them every round
+    would cost more than the boosting itself. A proportional sample keeps the curve's
+    shape while bounding the per-round cost, and the minimum of one row per class stops a
+    rare class from vanishing out of the monitored macro metrics.
+    """
+    total = int(len(labels))
+    budget = int(maximum_rows)
+    if budget <= 0 or total <= budget:
+        return np.arange(total, dtype=np.int64)
+    classes, counts = np.unique(labels, return_counts=True)
+    if len(classes) > budget:
+        raise ValueError(
+            f"monitor_split.maximum_rows={budget} cannot cover {len(classes)} classes"
+        )
+    exact = counts.astype(np.float64) * (budget / float(total))
+    quotas = np.maximum(1, np.floor(exact).astype(np.int64))
+    quotas = np.minimum(quotas, counts)
+    # Largest-remainder top-up, then trim from the largest classes if the minimum-one rule
+    # pushed the total over budget.
+    order = np.argsort(-(exact - np.floor(exact)), kind="stable")
+    index = 0
+    while quotas.sum() < budget and index < len(order) * 4:
+        candidate = order[index % len(order)]
+        if quotas[candidate] < counts[candidate]:
+            quotas[candidate] += 1
+        index += 1
+    while quotas.sum() > budget:
+        candidate = int(np.argmax(quotas))
+        if quotas[candidate] <= 1:
+            break
+        quotas[candidate] -= 1
+    rng = np.random.default_rng(int(seed))
+    chosen: list[np.ndarray] = []
+    for class_value, quota in zip(classes, quotas):
+        members = np.flatnonzero(labels == class_value)
+        if quota >= len(members):
+            chosen.append(members)
+            continue
+        chosen.append(rng.choice(members, size=int(quota), replace=False))
+    return np.sort(np.concatenate(chosen)).astype(np.int64)
 
 
 def lightgbm_safe_feature_names(feature_names: Sequence[str]) -> list[str]:
@@ -648,9 +784,19 @@ def build_datasets(prepared_data_dir: str | Path, config: Mapping[str, Any]) -> 
     for split in SPLIT_NAMES:
         parts = manifest["parts"][split]
         labels[split] = _read_split_labels(prepared, parts)
+    # Open-set rows carry OPEN_SET_LABEL_CODE: they have no output unit and must never
+    # reach a split the model fits or is scored on during boosting.
+    open_set_rows = {
+        split: int(np.count_nonzero(labels[split] == OPEN_SET_LABEL_CODE)) for split in SPLIT_NAMES
+    }
+    fitted = [split for split in ("train", "validation") if open_set_rows[split]]
+    if fitted:
+        raise AssertionError(f"Open-set rows reached the {fitted} split(s); they belong in test only")
     observed_set: set[int] = set()
     for split in SPLIT_NAMES:
-        observed_set.update(int(value) for value in np.unique(labels[split]))
+        observed_set.update(
+            int(value) for value in np.unique(labels[split]) if int(value) != OPEN_SET_LABEL_CODE
+        )
     observed = sorted(observed_set)
     expected = list(range(len(label_mapping)))
     if observed != expected:
@@ -667,6 +813,32 @@ def build_datasets(prepared_data_dir: str | Path, config: Mapping[str, Any]) -> 
     )
     model_feature_names = lightgbm_safe_feature_names(feature_names)
 
+    monitor_cfg = dict(config["dataset"].get("monitor_split") or {})
+    monitor_enabled = bool(monitor_cfg.get("enabled", False))
+    monitor_source = str(monitor_cfg.get("split", "test"))
+    monitor_name = str(monitor_cfg.get("name", "crossday"))
+    monitor_budget = int(monitor_cfg.get("maximum_rows", 0))
+    monitor_seed = int(monitor_cfg.get("seed", 2026))
+    monitor_indices: np.ndarray | None = None
+    if monitor_enabled:
+        if open_set_rows[monitor_source] == int(manifest["split"]["sizes"][monitor_source]):
+            raise ValueError(
+                f"dataset.monitor_split cannot watch the {monitor_source!r} split: it holds only "
+                "open-set rows, which have no trainable label to score against"
+            )
+        if open_set_rows[monitor_source]:
+            raise ValueError(
+                f"dataset.monitor_split cannot watch the {monitor_source!r} split while it mixes "
+                f"{open_set_rows[monitor_source]} open-set rows with trainable ones"
+            )
+        monitor_indices = stratified_monitor_indices(
+            labels[monitor_source], monitor_budget, monitor_seed
+        )
+        LOGGER.info(
+            "Monitoring %d of %d %s rows every round as evaluation set %r",
+            len(monitor_indices), len(labels[monitor_source]), monitor_source, monitor_name,
+        )
+
     import psutil
 
     guard = dict(config["dataset"].get("memory_guard") or {})
@@ -674,6 +846,7 @@ def build_datasets(prepared_data_dir: str | Path, config: Mapping[str, Any]) -> 
         manifest["split"]["sizes"], len(feature_names), len(label_mapping), params,
         int(psutil.virtual_memory().available),
         float(guard.get("available_ram_fraction", 0.8)),
+        monitor_rows=len(monitor_indices) if monitor_indices is not None else 0,
     )
     memory_estimate["raw_matrix_safe_to_materialize"] = bool(
         profile["safe_to_materialize_for_lightgbm"]
@@ -738,6 +911,24 @@ def build_datasets(prepared_data_dir: str | Path, config: Mapping[str, Any]) -> 
         feature_name=model_feature_names, categorical_feature=[], params=params,
         free_raw_data=free_raw,
     )
+    monitor_dataset = None
+    monitor_features = None
+    monitor_labels = None
+    if monitor_indices is not None:
+        monitor_features = RowSubsetFeatures(features[monitor_source], monitor_indices)
+        monitor_labels = np.asarray(labels[monitor_source])[monitor_indices]
+        # Materialised once, densely, then handed to LightGBM for binning. Unlike the train
+        # and validation Datasets this one is small enough by construction (bounded by
+        # monitor_split.maximum_rows) that the Sequence path would only add overhead.
+        monitor_matrix = features[monitor_source].read(monitor_indices)
+        monitor_dataset = lgb.Dataset(
+            monitor_matrix, label=monitor_labels, reference=train_dataset,
+            feature_name=model_feature_names, categorical_feature=[], params=params,
+            free_raw_data=free_raw,
+        )
+        del monitor_matrix
+        gc.collect()
+
     schema_payload = {
         "feature_names": feature_names,
         "model_feature_names": model_feature_names,
@@ -760,7 +951,51 @@ def build_datasets(prepared_data_dir: str | Path, config: Mapping[str, Any]) -> 
         feature_schema_hash=canonical_hash(schema_payload),
         feature_selection=feature_selection,
         memory_estimate=memory_estimate,
+        monitor_dataset=monitor_dataset,
+        monitor_features=monitor_features,
+        monitor_labels=monitor_labels,
+        monitor_name=monitor_name if monitor_dataset is not None else None,
+        monitor_source_split=monitor_source if monitor_dataset is not None else None,
+        monitor_indices=monitor_indices,
     )
+
+
+def multiclass_macro_metrics(
+    num_classes: int,
+) -> Callable[[np.ndarray, Any], list[tuple[str, float, bool]]]:
+    """Per-round Macro-F1 and Macro-Recall for every evaluation set.
+
+    Macro-Recall is balanced accuracy. On CIC-DDoS2019 the largest class is 28.5% of the
+    rows, so plain accuracy is close to uninformative; reporting the balanced figure every
+    round -- not only in the final table -- is what makes the learning curves readable.
+    """
+    labels_order = list(range(num_classes))
+
+    def evaluate(predictions: np.ndarray, dataset: Any) -> list[tuple[str, float, bool]]:
+        probabilities = np.asarray(predictions)
+        labels = np.asarray(dataset.get_label(), dtype=np.int32)
+        if probabilities.ndim == 1:
+            probabilities = probabilities.reshape(num_classes, -1).T
+        if probabilities.shape != (len(labels), num_classes):
+            raise ValueError(
+                f"Unexpected multiclass prediction shape {probabilities.shape}; "
+                f"expected {(len(labels), num_classes)}"
+            )
+        predicted = np.argmax(probabilities, axis=1)
+        return [
+            (
+                "macro_f1",
+                float(f1_score(labels, predicted, labels=labels_order, average="macro", zero_division=0)),
+                True,
+            ),
+            (
+                "macro_recall",
+                float(recall_score(labels, predicted, labels=labels_order, average="macro", zero_division=0)),
+                True,
+            ),
+        ]
+
+    return evaluate
 
 
 def macro_f1_metric(num_classes: int) -> Callable[[np.ndarray, Any], tuple[str, float, bool]]:
@@ -803,6 +1038,7 @@ class IterationRecorder:
         maximum_session_hours: float,
         stop_before_minutes: float,
         environment: str = "local",
+        monitor_name: str | None = None,
     ) -> None:
         self.history = history
         self.session_id = session_id
@@ -816,6 +1052,7 @@ class IterationRecorder:
         self.session_start_iteration = int(session_start_iteration)
         self.maximum_session_hours = float(maximum_session_hours)
         self.stop_before_minutes = float(stop_before_minutes)
+        self.monitor_name = str(monitor_name) if monitor_name else None
         self.last_perf = time.perf_counter()
         self.last_timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -847,6 +1084,10 @@ class IterationRecorder:
             "val_multi_error": metrics.get("validation_multi_error"),
             "train_macro_f1": metrics.get("train_macro_f1"),
             "val_macro_f1": metrics.get("validation_macro_f1"),
+            # Macro-recall is balanced accuracy; on a dataset whose largest class is 28.5%
+            # of the rows it is the honest per-round companion to plain accuracy.
+            "train_macro_recall": metrics.get("train_macro_recall"),
+            "val_macro_recall": metrics.get("validation_macro_recall"),
             "iteration_seconds": now_perf - self.last_perf,
             "checkpoint_seconds": 0.0,
             "is_final_round": current == self.target_iteration,
@@ -854,6 +1095,18 @@ class IterationRecorder:
         required_metrics = [key for key, value in record.items() if key.startswith(("train_", "val_")) and value is None]
         if required_metrics:
             raise RuntimeError(f"LightGBM callback did not receive required metrics: {required_metrics}")
+        if self.monitor_name:
+            monitored = {
+                f"monitor_{suffix}": metrics.get(f"{self.monitor_name}_{suffix}")
+                for suffix in ("multi_logloss", "multi_error", "macro_f1", "macro_recall")
+            }
+            absent = sorted(key for key, value in monitored.items() if value is None)
+            if absent:
+                raise RuntimeError(
+                    f"Monitoring set {self.monitor_name!r} produced no {absent}; check valid_names"
+                )
+            record.update(monitored)
+            record["monitor_name"] = self.monitor_name
         self.history.append(record)
         self.last_perf = now_perf
         self.last_timestamp = now_timestamp

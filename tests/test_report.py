@@ -104,6 +104,8 @@ class ReportPipelineTest(unittest.TestCase):
                     "val_multi_error": 0.52 - iteration * 0.0009,
                     "train_macro_f1": 0.4 + iteration * 0.002,
                     "val_macro_f1": 0.38 + iteration * 0.0018,
+                    "train_macro_recall": 0.42 + iteration * 0.0019,
+                    "val_macro_recall": 0.39 + iteration * 0.0017,
                     "iteration_seconds": 0.1,
                     "checkpoint_seconds": 0.2 if iteration % 10 == 0 else 0.0,
                     "is_final_round": iteration == 100,

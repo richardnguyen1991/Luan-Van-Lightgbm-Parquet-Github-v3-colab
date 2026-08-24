@@ -18,8 +18,13 @@ từ boosting iteration kế tiếp.
 - Toàn bộ train split dùng ở cả 100 vòng; validation chỉ theo dõi, test chỉ đánh giá một lần.
 - `feature_selection = "none"`: **dùng toàn bộ 80 thuộc tính** còn lại sau tiền xử lý, không
   sàng lọc thêm cột nào. Cơ chế sàng lọc theo gain vẫn còn trong mã nguồn như một van xả RAM,
-  nhưng mặc định tắt (xem *Chọn thuộc tính theo gain*). Cột chỉ số dòng `Unnamed: 0` bị loại ở
-  bước tiền xử lý vì nó rò rỉ nhãn (xem *Cột `Unnamed: 0` và rò rỉ theo chỉ số dòng*).
+  nhưng mặc định tắt (xem *Chọn thuộc tính theo gain*). Bốn cột chỉ số/xuất xứ — `Unnamed: 0`,
+  `__source_row_id`, `__source_file_id`, `__capture_day` — bị loại ở bước tiền xử lý vì chúng
+  rò rỉ nhãn (xem *Cột chỉ số dòng và rò rỉ nhãn*).
+- **14 lớp, không phải 19**: các cặp nhãn trùng của hai ngày capture được gộp trước khi chia
+  split (xem *Gộp nhãn: 19 → 14 lớp*).
+- **Macro-F1 và balanced accuracy là chỉ số chính**; accuracy chỉ là phụ (xem *Chỉ số nào
+  được coi là chính*).
 - CPU bắt buộc, seed cố định, `deterministic=true`, `force_col_wise=true`.
 - Checkpoint mỗi 10 vòng: Booster `.txt` + `training_state.json` + `history.json` append-only.
 - Model cuối luôn là `final_model_round_100.txt`.
@@ -112,6 +117,13 @@ notebook đã commit.
 Notebook làm đúng 5 việc: clone repo (in ra commit SHA để truy vết), nạp secret, chuẩn bị
 hoặc tải dữ liệu, huấn luyện, rồi hiển thị learning curves + confusion matrix +
 `summary_metrics.csv` ngay trong notebook.
+
+**Chọn thí nghiệm ở cell 3.** Ô `EXPERIMENT` có ba giá trị — `A_random_split`,
+`B_cross_capture_day`, `C_open_set` (xem *Ba thí nghiệm*). Mỗi lựa chọn dùng một cặp config
+riêng, một thư mục prepared riêng (`outputs/data`, `outputs/data-expB`, `outputs/data-expC`),
+một hậu tố `S3_PREFIX` riêng và một `run_id` có gắn tag thí nghiệm. Nhờ vậy ba thí nghiệm
+chạy được theo thứ tự bất kỳ mà không đè lên nhau — và quan trọng hơn, một dataset 6 lớp
+không thể resume nhầm lên checkpoint 14 lớp rồi chết ở guard `feature_schema_hash`.
 
 Dataset gốc lấy từ Kaggle: `dungnguyen28101991/cicddos2019-parquet` (ô `KAGGLE_DATASET` trong
 cell 3). Prompt gốc trong `Prompt_Training_LightGBM_Optimized.docx` nhắc tới slug cũ
@@ -206,7 +218,7 @@ tại. Con số quyết định run có sống sót hay không là thứ khác:
 thì `train.py` **thoát 75 (dừng an toàn)** chứ không để bị OOM-kill giữa iteration — checkpoint
 S3 còn nguyên, watchdog thử lại trên worker lớn hơn.
 
-## Cột `Unnamed: 0` và rò rỉ theo chỉ số dòng
+## Cột chỉ số dòng và rò rỉ nhãn
 
 `Unnamed: 0` là `RangeIndex` của pandas bị ghi ra khi bộ CIC-DDoS2019 gốc được convert từ CSV
 sang Parquet. Nó **không** phải một đặc trưng mạng, nhưng bộ lọc tiền xử lý ban đầu để lọt nó
@@ -222,13 +234,30 @@ chiếm ngôi đầu bảng `feature_importance_gain`. Chia train/val/test theo 
 quan hệ này — trong mỗi split nó vẫn nguyên vẹn. Metric của một run còn cột này bị thổi phồng
 và không nói lên điều gì về hành vi mạng.
 
-Bản vá là một dòng trong cả `config/data.json` lẫn `config/data.smoke.json`:
+`__source_row_id` là **đúng cùng một lỗi, lọt lưới lần thứ hai**. Notebook chuyển CSV sang
+Parquet phụ thêm ba cột xuất xứ và ghi rõ ở đầu file rằng chúng *"must never be classifier
+features"*: `__capture_day`, `__source_file_id` (cả hai kiểu `string`, nên bị loại tự động vì
+không phải số) và `__source_row_id` — một bộ đếm dòng `int64` chạy `0..N-1` **trong từng file
+nguồn**. Nó qua được `_arrow_is_numeric`, không khớp pattern nào, không nằm trong
+`explicit_drop_columns`, nên trở thành thuộc tính. Trong run `lightgbm_998247ffcfd3c0c0` nó
+đứng **hạng 8 về total gain**, và vì mỗi file là một loại tấn công với độ dài rất khác nhau
+(TFTP 20.1 triệu dòng, Portmap 191 nghìn, WebDDoS vài trăm) nó là một prior rất mạnh về nhãn.
+
+Bản vá liệt kê cả bốn cột trong mọi `config/data*.json`:
 
 ```json
 "explicit_drop_columns": [
-  "Unnamed: 0"
+  "Unnamed: 0",
+  "__source_row_id",
+  "__source_file_id",
+  "__capture_day"
 ]
 ```
+
+`__capture_day` vẫn được **đọc** — split theo ngày dùng nó làm khoá — nhưng không bao giờ vào
+ma trận thuộc tính. `tests/test_experiments.py` chốt điều này cho cả bốn cấu hình dữ liệu:
+mỗi cột phải xuất hiện trong `preprocessing.json → dropped_columns` với lý do
+`explicitly excluded by configuration`.
 
 `_drop_reasons` so khớp `casefold()` nên hoa/thường không quan trọng, nhưng đây là so khớp
 **đúng tên**, không phải regex: nếu bộ dữ liệu của bạn còn `Unnamed: 0.1` hay `unnamed:_0` thì
@@ -358,7 +387,15 @@ worker nào ghi heartbeat gần nhất thì giữ quyền, worker đến sau tho
 mỗi `session.heartbeat_seconds` (mặc định 300 giây) bởi một thread nền trong `train.py`, nên
 watchdog phân biệt được "đang chạy chậm" với "đã chết".
 
-## Hai profile huấn luyện
+## Các profile cấu hình
+
+| File | Vai trò |
+|---|---|
+| `config/data.json` + `config/train.json` | Thí nghiệm A trên Colab Pro |
+| `config/train.gha.json` | Thí nghiệm A trên runner GitHub (fallback) |
+| `config/data.expB.json` + `config/train.expB.json` | Thí nghiệm B, có bật `monitor_split` |
+| `config/data.expC.json` + `config/train.expC.json` | Thí nghiệm C, open-set |
+| `config/data.smoke.json` + `config/train.smoke.json` | Chạy thử cục bộ |
 
 `config/train.json` (Colab Pro) và `config/train.gha.json` (runner GitHub) có **mọi
 hyperparameter học giống hệt nhau**, kể cả khối `feature_screening` quyết định 20 cột nào vào
@@ -366,6 +403,10 @@ model — chỉ khác `num_threads` và ngân sách thời gian/RAM.
 LightGBM ghi rõ `deterministic=true` cho kết quả ổn định *kể cả khi `num_threads` khác nhau*,
 nên một run có thể chuyển qua lại giữa hai môi trường. Test
 `test_runner_profile_differs_only_in_resource_parameters` khoá tính chất này.
+
+Các profile thí nghiệm cũng giữ nguyên hợp đồng học (100 vòng, `learning_rate=0.05`,
+`num_leaves=31`, không early stopping): chúng chỉ khác ở **dữ liệu nào được đưa vào** và
+**tập nào được theo dõi**, đúng như một thí nghiệm đối chứng phải thế.
 
 ## Lưu ý về tái lập khi resume
 
@@ -412,6 +453,25 @@ python train.py --config config/train.smoke.json --prepared-data-dir outputs/dat
 python make_report.py --run-dir outputs/runs-smoke/<run_id> --no-upload-to-s3
 ```
 
+Ba thí nghiệm trên dữ liệu đầy đủ, chạy cục bộ:
+
+```bash
+# A — in-distribution, 14 lớp
+python data.py  --config config/data.json  --output-dir outputs/data --full-dataset
+python train.py --config config/train.json --prepared-data-dir outputs/data \
+                --output-dir outputs/runs
+
+# B — tổng quát hoá liên ngày, 6 lớp giao, có đường cong crossday
+python data.py  --config config/data.expB.json  --output-dir outputs/data-expB --full-dataset
+python train.py --config config/train.expB.json --prepared-data-dir outputs/data-expB \
+                --output-dir outputs/runs
+
+# C — open-set: Portmap chưa từng được huấn luyện
+python data.py  --config config/data.expC.json  --output-dir outputs/data-expC --full-dataset
+python train.py --config config/train.expC.json --prepared-data-dir outputs/data-expC \
+                --output-dir outputs/runs
+```
+
 Tái tạo báo cáo từ artifact S3 mà không huấn luyện lại:
 
 ```bash
@@ -446,21 +506,155 @@ s3://<bucket>/<prefix>/
                         feature_selection.json (xếp hạng gain của mọi cột ứng viên)
 ```
 
+## Gộp nhãn: 19 → 14 lớp
+
+Bộ dữ liệu có hai ngày capture và **đặt tên khác nhau cho cùng một cuộc tấn công**. Đếm trực
+tiếp cột `Label` của cả 18 file CSV gốc (tổng 70,427,637 dòng, khớp từng nhãn với
+`data_profile.json`) cho kết quả dứt khoát:
+
+| Nhãn | 01-12 | 03-11 |
+|---|---:|---:|
+| `DrDoS_LDAP` / `LDAP` | 2,179,930 | 1,915,122 |
+| `DrDoS_MSSQL` / `MSSQL` | 4,522,492 | 5,787,453 |
+| `DrDoS_NetBIOS` / `NetBIOS` | 4,093,279 | 3,657,497 |
+| `DrDoS_UDP` / `UDP` | 3,134,645 | 3,867,155 |
+| `UDP-lag` / `UDPLag` | 366,461 | 1,873 |
+
+Cách viết **trùng khít với ngày capture**: 01-12 luôn dùng tiền tố `DrDoS_` và `UDP-lag`,
+03-11 luôn dùng tên trần và `UDPLag`. Đây là artifact của quy trình gán nhãn, không phải hai
+hiện tượng mạng khác nhau. Giữ 19 lớp nghĩa là phạt mô hình vì một lỗi đặt tên: 5 cặp không
+thể tách được về mặt đặc trưng luồng, và chúng chiếm ~46% số dòng — đủ để giải thích vì sao
+`multi_error` đứng yên quanh 19.8% từ vòng 15 trở đi.
+
+`labels.merge_map` trong `config/data*.json` gộp 9 tên về 5, cho **14 lớp**: BENIGN, DNS,
+LDAP, MSSQL, NTP, NetBIOS, Portmap, SNMP, SSDP, Syn, TFTP, UDP, UDPLag, WebDDoS. Phép gộp
+chạy **trước** khi split code được gán, nên nó ảnh hưởng cả pre-flight lẫn split thực tế, và
+`preprocessing.json → label_policy` ghi lại chính xác ánh xạ đã dùng.
+
+## Ba thí nghiệm
+
+| | A — `data.json` | B — `data.expB.json` | C — `data.expC.json` |
+|---|---|---|---|
+| Câu hỏi | in-distribution | tổng quát hoá liên ngày | open-set |
+| Lớp | 14 | 6 lớp giao | 13 huấn luyện, Portmap giữ lại |
+| Split | group-aware ngẫu nhiên 70/15/15 | train/val = 01-12, test = 03-11 | train/val = 01-12, test = chỉ Portmap |
+| Chỉ số | Macro-F1, balanced accuracy, per-class | Macro-F1 + recall từng lớp | phân bố dự đoán, độ tin cậy, entropy |
+| Train config | `train.json` | `train.expB.json` | `train.expC.json` |
+
+### Vì sao split theo ngày bắt buộc phải gộp nhãn trước
+
+Với 19 nhãn thô, **giao của hai ngày chỉ có `BENIGN` và `Syn`**. Train trên 01-12 rồi test
+trên 03-11 sẽ khiến 11/13 lớp đã học không tồn tại trong tập test. Phép gộp 14 lớp không phải
+phương án song song với split theo ngày — nó là điều kiện tiên quyết.
+
+Ngay cả sau khi gộp, tập nhãn hai ngày vẫn lệch: `DNS`, `NTP`, `SNMP`, `SSDP`, `TFTP`,
+`WebDDoS` chỉ có ở 01-12; `Portmap` chỉ có ở 03-11. Vì vậy thí nghiệm B giới hạn vào
+`labels.keep_only` = 6 lớp chung (BENIGN, LDAP, MSSQL, NetBIOS, Syn, UDP) — còn 15.9 triệu
+dòng train và 20.2 triệu dòng test. `UDPLag` bị loại có chủ ý dù về danh nghĩa là lớp chung:
+phía 03-11 chỉ có 1,873 dòng so với 366,461 dòng phía 01-12, và file
+`03-11/UDPLag.csv` thực tế chứa 606,749 dòng `Syn` cùng 112,475 dòng `UDP` — không đủ căn cứ
+để coi 1,873 dòng đó là cùng hiện tượng.
+
+### `split.strategy = "by_capture_day"`
+
+```json
+"split": {
+  "strategy": "by_capture_day",
+  "capture_day_column": "__capture_day",
+  "capture_day_assignment": {"01-12": "train_validation", "03-11": "test"},
+  "validation_fraction_of_train_day": 0.15
+}
+```
+
+Ngày mang vai trò `test` đi trọn vào test; ngày `train_validation` được cắt 85/15 bằng đúng
+group hash cũ, nên ranh giới train↔validation vẫn an toàn ở mức flow. Ngày **không** có vai
+trò nào thì mọi dòng bị loại — đó là cơ chế cho phép thí nghiệm C giữ 03-11 ngoài cuộc mà vẫn
+nhận riêng lớp Portmap.
+
+**Phạm vi audit rò rỉ thay đổi theo chủ đích.** Với `by_capture_day`, một Flow ID 5-tuple lặp
+lại ở ngày kia là đặc tính của mạng chứ không phải rò rỉ, nên audit nhóm chỉ áp cho ranh giới
+train↔validation (trong cùng một ngày). Manifest ghi rõ điều này ở
+`split.group_audit_scope = ["train", "validation"]`; audit theo `sample_id` vẫn phủ cả ba split.
+
+### Thí nghiệm C: open-set
+
+`labels.open_set_labels = ["Portmap"]` khiến các dòng Portmap:
+
+- **không** vào `label_mapping.json` — mô hình không có output unit cho chúng;
+- bị ép vào split `test` bất kể ngày nào;
+- được mã hoá `_label = -1` (`OPEN_SET_LABEL_CODE`).
+
+`make_report.py` nhận ra tập test toàn `-1` và chuyển sang nhánh open-set: **không** báo cáo
+accuracy, precision, recall, ROC hay confusion matrix — tất cả đều vô định khi lớp đúng không
+tồn tại trong không gian đầu ra. Thay vào đó nó xuất
+`open_set_prediction_distribution.csv` + `open_set_distribution.png`, cùng
+`mean_max_probability` và `mean_predictive_entropy`. Một mô hình dồn lưu lượng lạ vào một lớp
+láng giềng với độ tin cậy cao là rủi ro vận hành rất khác với một mô hình rải đều — chỉ bảng
+này phân biệt được hai trường hợp.
+
+## Đường cong thứ ba: vì sao train và validation luôn chồng lên nhau
+
+Trên 49.3 triệu dòng train, 1,900 cây × 31 lá là ~1.6 triệu dòng mỗi lá: mô hình không có chỗ
+để ghi nhớ dòng riêng lẻ. Cộng với việc validation được rút ngẫu nhiên từ đúng cùng một tổng
+thể, khoảng cách train–validation ở vòng 100 chỉ là 0.0076 logloss — nhỏ hơn một sai số chuẩn
+của phép đo. **Hai đường trùng khít là bằng chứng về cách chia dữ liệu, không phải về khả năng
+tổng quát hoá.**
+
+`dataset.monitor_split` thêm một tập đánh giá thứ ba để biểu đồ nói được điều đó:
+
+```json
+"monitor_split": {
+  "enabled": true, "split": "test", "name": "crossday",
+  "maximum_rows": 2000000, "seed": 2026
+}
+```
+
+Đây là mẫu phân tầng theo lớp (tối thiểu một dòng mỗi lớp, xác định theo seed) của ngày giữ
+lại, được chấm điểm mỗi vòng cùng train và validation. Kết quả là một hình duy nhất có ba
+đường: `train` và `validation` chồng lên nhau, `crossday` tách hẳn.
+
+Nó **không** được dùng để chọn mô hình: `early_stopping = false` và số vòng cố định 100, nên
+việc theo dõi không làm hỏng tính khách quan. `run_config.json → monitoring` ghi lại điều đó
+(`used_for_model_selection: false`). Chi phí RAM của tập thứ ba đã được cộng vào
+`model.estimate_training_memory` (bins + score + prediction buffer + lần vật chất hoá float32
+duy nhất lúc dựng), nên `require_safe_memory_profile` vẫn chặn đúng.
+
+## Chỉ số nào được coi là chính
+
+TFTP một mình chiếm 28.5% corpus, nên accuracy gần như vô nghĩa: đoán bừa lớp đông nhất đã
+được 28.5%. Vì vậy:
+
+- `summary_metrics.csv` mở đầu bằng **Macro F1** rồi **Balanced Accuracy**; Accuracy bị đẩy
+  xuống sau MCC và Weighted F1.
+- `test_metrics.json` khai báo tường minh `primary_metrics = ["macro_f1",
+  "balanced_accuracy"]` và `secondary_metrics = ["accuracy", "weighted_f1"]`.
+- Balanced accuracy (= macro recall) được tính **mỗi vòng**, không chỉ ở bảng cuối, nên
+  `learning_curves` có panel riêng cho nó.
+
 ## Biểu đồ và metric
 
 13 nhóm hình, mỗi nhóm xuất đồng thời PNG 300 dpi + PDF vector + CSV dữ liệu:
 
-- `learning_curves` — **biểu đồ loss, biểu đồ accuracy** và Macro-F1 (train vs validation),
-  kèm vạch đứt `Resume` tại mỗi lần đổi session. Vẽ lại và upload sau **mỗi** checkpoint block.
+- `learning_curves` — **bốn panel**: Multi-logloss, Macro-F1, Balanced Accuracy và Accuracy
+  (theo thứ tự đó, accuracy đứng cuối vì nó ít nói nhất). Mỗi panel vẽ `Train`, `Validation`
+  và — nếu `monitor_split` bật — `Crossday`, kèm vạch đứt `Resume` tại mỗi lần đổi session.
+  CSV đi kèm còn có `val_minus_train_multi_logloss` và `monitor_minus_val_multi_logloss` để
+  trích dẫn khoảng cách bằng số thay vì ước lượng bằng mắt. Vẽ lại và upload sau **mỗi**
+  checkpoint block.
+- `open_set_distribution` — chỉ có ở thí nghiệm C: mô hình gán lớp chưa từng thấy vào đâu.
 - `confusion_matrix` (chuẩn hoá theo hàng) và `confusion_matrix_raw` (đếm thô, thang log).
 - `roc_curves`, `pr_curves`, `per_class_f1`, `class_distribution`, `iteration_time`,
   `lr_schedule`.
 - Bốn nhóm feature importance: gain, split, permutation, SHAP.
 
-`summary_metrics.csv` gồm Accuracy, Balanced Accuracy, Macro/Weighted Precision–Recall–F1,
-MCC, F1 lớp thiểu số nhỏ nhất, Log Loss, AUC-ROC (macro-OVR / weighted-OVR / micro), PR-AUC,
-`final_iteration=100`, `num_trees`, `model_size_mb`, thời gian train, độ trễ p50/p95, thông
-lượng và peak RSS.
+`summary_metrics.csv` mở đầu bằng **Macro F1** và **Balanced Accuracy**, rồi Macro
+Precision–Recall, MCC, Weighted F1, Accuracy, F1 lớp thiểu số nhỏ nhất, Log Loss, AUC-ROC
+(macro-OVR / weighted-OVR / micro), PR-AUC, `final_iteration=100`, `num_trees`,
+`model_size_mb`, thời gian train, độ trễ p50/p95, thông lượng và peak RSS.
+
+Ở thí nghiệm C, `summary_metrics.csv` có dạng khác hẳn (`evaluation_mode = open_set`,
+`dominant_predicted_class`, `mean_max_probability`, `mean_predictive_entropy`) — đúng như nó
+phải thế, vì không có nhãn đúng nào để đo.
 
 ## Nghiệm thu
 
@@ -481,6 +675,19 @@ lượng và peak RSS.
    (Nếu bật lại sàng lọc: `fit_split = "train"` và `ranking_by_gain` phủ hết cột ứng viên,
    chứng minh việc chọn cột không chạm vào validation/test.)
 9. Repo public không chứa `AKIA` hay secret trong `.ipynb`.
+10. `preprocessing.json → dropped_columns` chứa cả bốn cột `Unnamed: 0`, `__source_row_id`,
+    `__source_file_id`, `__capture_day` với lý do `explicitly excluded by configuration`, và
+    `feature_importance_gain` **không** còn cột nào trong số đó.
+11. `label_mapping.json` có đúng 14 khoá ở thí nghiệm A, không khoá nào bắt đầu bằng `DrDoS_`
+    và không có `UDP-lag`.
+12. Ở thí nghiệm B: `sample_manifest.json → split.strategy = "by_capture_day"`,
+    `split.group_audit_scope = ["train", "validation"]`, và `history.json` có
+    `monitor_macro_f1` ở đủ 100 vòng. Trong `learning_curves.csv`,
+    `monitor_minus_val_multi_logloss` phải lớn hơn `val_minus_train_multi_logloss` — nếu
+    không, split theo ngày đã thôi là split theo ngày.
+13. Ở thí nghiệm C: `test_metrics.json → evaluation_mode = "open_set"`, không có khoá
+    `accuracy`, và `open_set_prediction_distribution.csv` phủ đủ 13 lớp đã huấn luyện.
+14. `history.json` có `train_macro_recall` và `val_macro_recall` ở mọi vòng.
 
 ## Kiểm tra quyền S3 trước khi train
 

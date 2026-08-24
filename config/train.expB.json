@@ -1,7 +1,7 @@
 {
   "project_name": "Luan-Van-Lightgbm-Parquet-Github-v3-colab",
   "model_name": "lightgbm",
-  "experiment_role": "full_dataset_all_features",
+  "experiment_role": "cross_capture_day_generalisation",
   "seed": 2026,
   "device": "cpu",
   "num_boost_round": 100,
@@ -44,15 +44,8 @@
     "verbosity": 1
   },
   "dataset": {
-    "prepared_data_dir": "outputs/data",
+    "prepared_data_dir": "outputs/data-expB",
     "require_full_dataset_manifest": true,
-    "monitor_split": {
-      "enabled": false,
-      "split": "test",
-      "name": "crossday",
-      "maximum_rows": 2000000,
-      "seed": 2026
-    },
     "feature_screening": {
       "maximum_features": 20,
       "balanced_train_rows": 500000,
@@ -68,6 +61,13 @@
     "init_score_chunk_rows": 250000,
     "memory_guard": {
       "available_ram_fraction": 0.8
+    },
+    "monitor_split": {
+      "enabled": true,
+      "split": "test",
+      "name": "crossday",
+      "maximum_rows": 2000000,
+      "seed": 2026
     }
   },
   "checkpoint": {

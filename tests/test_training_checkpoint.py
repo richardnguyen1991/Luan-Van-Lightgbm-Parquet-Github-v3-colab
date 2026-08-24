@@ -136,6 +136,8 @@ class ContractAndMetricTest(unittest.TestCase):
                     ("validation", "multi_error", 0.4, False),
                     ("train", "macro_f1", 0.7, True),
                     ("validation", "macro_f1", 0.6, True),
+                    ("train", "macro_recall", 0.72, True),
+                    ("validation", "macro_recall", 0.62, True),
                 ]
                 recorder(SimpleNamespace(model=booster, evaluation_result_list=values))
         self.assertEqual([item["iteration"] for item in history], list(range(1, 11)))

@@ -118,31 +118,59 @@ def _downsample(*arrays: np.ndarray) -> tuple[np.ndarray, ...]:
 
 
 def plot_learning_curves(run_dir: Path, callback: ArtifactCallback | None = None) -> list[Path]:
+    """Four panels per run, and up to three curves per panel.
+
+    Train and validation are drawn from the same population, so on a dataset of this size
+    they sit on top of each other whatever the model does -- that overlap is evidence about
+    the split, not about generalisation. When a run monitors a held-out capture day, its
+    curve is drawn alongside and is the one that carries information.
+
+    Macro-F1 and balanced accuracy lead; plain accuracy is last, because the largest class
+    is 28.5% of CIC-DDoS2019 and a model can score high on it while missing minority
+    attacks entirely.
+    """
     _, history, _, model, run_id, final_iteration = _context(run_dir)
     table = pd.DataFrame(history)
     required = {
         "iteration", "session_id", "train_multi_logloss", "val_multi_logloss",
         "train_multi_error", "val_multi_error", "train_macro_f1", "val_macro_f1",
+        "train_macro_recall", "val_macro_recall",
     }
     missing = sorted(required.difference(table.columns))
     if missing:
         raise ValueError(f"history.json lacks learning-curve fields: {missing}")
+    monitor_names = (
+        {str(value) for value in table["monitor_name"].dropna().unique()}
+        if "monitor_name" in table.columns else set()
+    )
+    if len(monitor_names) > 1:
+        raise ValueError(f"history.json mixes monitoring sets across sessions: {sorted(monitor_names)}")
+    monitor_label = next(iter(monitor_names), None)
+    monitor_columns = [
+        "monitor_multi_logloss", "monitor_multi_error", "monitor_macro_f1", "monitor_macro_recall",
+    ]
+    has_monitor = bool(monitor_label) and all(
+        column in table.columns and table[column].notna().all() for column in monitor_columns
+    )
     changes = [
         int(table.iloc[index]["iteration"])
         for index in range(1, len(table))
         if table.iloc[index]["session_id"] != table.iloc[index - 1]["session_id"]
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(17, 5.2))
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5.2))
     panels = (
-        ("train_multi_logloss", "val_multi_logloss", "Multi-logloss", "Multi-logloss", False),
-        ("train_multi_error", "val_multi_error", "Accuracy", "Accuracy", True),
-        ("train_macro_f1", "val_macro_f1", "Macro-F1", "Macro-F1", False),
+        ("multi_logloss", "Multi-logloss", "Multi-logloss", False),
+        ("macro_f1", "Macro-F1", "Macro-F1", False),
+        ("macro_recall", "Balanced Accuracy", "Balanced accuracy (macro recall)", False),
+        ("multi_error", "Accuracy", "Accuracy", True),
     )
-    for axis, (train_col, val_col, panel, ylabel, invert) in zip(axes, panels):
-        train_values = 1.0 - table[train_col] if invert else table[train_col]
-        val_values = 1.0 - table[val_col] if invert else table[val_col]
-        axis.plot(table["iteration"], train_values, label="Train", **_line_style(0))
-        axis.plot(table["iteration"], val_values, label="Validation", **_line_style(1))
+    for axis, (suffix, panel, ylabel, invert) in zip(axes, panels):
+        series = [("Train", f"train_{suffix}"), ("Validation", f"val_{suffix}")]
+        if has_monitor:
+            series.append((str(monitor_label).replace("_", " ").title(), f"monitor_{suffix}"))
+        for index, (name, column) in enumerate(series):
+            values = 1.0 - table[column] if invert else table[column]
+            axis.plot(table["iteration"], values, label=name, **_line_style(index))
         for index, iteration in enumerate(changes):
             axis.axvline(iteration, color="#666666", linestyle="--", linewidth=1.0, label="Resume" if index == 0 else None)
         axis.set_title(panel, fontsize=TITLE_FONT_SIZE)
@@ -154,11 +182,50 @@ def plot_learning_curves(run_dir: Path, callback: ArtifactCallback | None = None
     plot_table = table.copy()
     plot_table["train_accuracy"] = 1.0 - plot_table["train_multi_error"]
     plot_table["val_accuracy"] = 1.0 - plot_table["val_multi_error"]
+    # The generalisation gap the figure exists to show, written down so it can be quoted
+    # rather than eyeballed off the plot.
+    plot_table["val_minus_train_multi_logloss"] = (
+        plot_table["val_multi_logloss"] - plot_table["train_multi_logloss"]
+    )
+    if has_monitor:
+        plot_table["monitor_accuracy"] = 1.0 - plot_table["monitor_multi_error"]
+        plot_table["monitor_minus_val_multi_logloss"] = (
+            plot_table["monitor_multi_logloss"] - plot_table["val_multi_logloss"]
+        )
+        plot_table["monitor_minus_val_macro_f1"] = (
+            plot_table["val_macro_f1"] - plot_table["monitor_macro_f1"]
+        )
     paths = _save_figure(fig, run_dir, "learning_curves", plot_table, callback)
     history_csv = run_dir / "metrics" / "history.csv"
     table.to_csv(history_csv, index=False, float_format="%.6f")
     _notify((history_csv,), "metrics", callback)
     return [*paths, history_csv]
+
+
+def plot_open_set_distribution(
+    run_dir: Path, table: pd.DataFrame, callback: ArtifactCallback | None = None
+) -> list[Path]:
+    """Where a closed-set model sends rows of a class it has never seen.
+
+    There is no diagonal to draw here: the true class has no column in the model's output
+    space. The bar chart is the whole result of the open-set experiment.
+    """
+    _, _, _, model, run_id, final_iteration = _context(run_dir)
+    ordered = table.sort_values("rows", ascending=True, ignore_index=True)
+    height = max(4.0, 0.36 * len(ordered) + 1.6)
+    fig, axis = plt.subplots(figsize=(10.5, height))
+    axis.barh(ordered["predicted_class"], ordered["share"], color=COLOR_PALETTE[0])
+    for index, share in enumerate(ordered["share"]):
+        axis.text(share, index, f" {share:.1%}", va="center", fontsize=9)
+    axis.set_xlim(0, min(1.0, float(ordered["share"].max()) * 1.18 + 0.02))
+    axis.set_xlabel("Share of unseen-class rows assigned", fontsize=AXIS_FONT_SIZE)
+    axis.set_ylabel("Predicted class", fontsize=AXIS_FONT_SIZE)
+    axis.set_title(
+        _title("Open-Set Prediction Distribution", model, run_id, final_iteration),
+        fontsize=TITLE_FONT_SIZE,
+    )
+    _style_axis(axis)
+    return _save_figure(fig, run_dir, "open_set_distribution", table, callback)
 
 
 def plot_lr_schedule(run_dir: Path, callback: ArtifactCallback | None = None) -> list[Path]:
