@@ -60,6 +60,13 @@ class ColabNotebookTest(unittest.TestCase):
         self.assertIn("--stop-before-minutes", source)
         self.assertIn('session["maximum_hours"]', source)
 
+    def test_notebook_pins_the_run_id_to_the_preprocessing_recipe(self):
+        """A bare train.py resolves the run from S3 and resumes onto the previous recipe."""
+        notebook = json.loads((PROJECT_ROOT / "colab_runner.ipynb").read_text(encoding="utf-8"))
+        source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
+        self.assertIn("--run-id", source)
+        self.assertIn("compute_data_version", source)
+
     def test_notebook_names_the_kaggle_dataset_actually_used(self):
         notebook = json.loads((PROJECT_ROOT / "colab_runner.ipynb").read_text(encoding="utf-8"))
         source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])

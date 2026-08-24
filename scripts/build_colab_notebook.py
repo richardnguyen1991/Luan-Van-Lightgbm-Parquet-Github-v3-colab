@@ -188,11 +188,23 @@ SOURCE_DIR = Path("/content/src")
 PREPARED_DIR = Path("/content/outputs/data")
 RUNS_DIR = Path("/content/outputs/runs")
 
+# Pin the run to the preprocessing recipe it was trained on. Without --run-id, train.py
+# resolves the run from active_run.json on S3, which still points at whatever ran last: after
+# a recipe change that resumes onto a checkpoint built from a different feature set and dies
+# at the feature_schema_hash guard. Deriving the id from data_version gives both properties a
+# resume needs -- identical every session, and new the moment the recipe changes.
+sys.path.insert(0, str(SOURCE_DIR))
+from data import compute_data_version, load_config
+
+RUN_ID = "lightgbm_" + compute_data_version(load_config(SOURCE_DIR / "config" / "data.json"))
+print(f"run_id: {RUN_ID}")
+
 train_code = subprocess.call([
     sys.executable, "train.py",
     "--config", "config/train.json",
     "--prepared-data-dir", str(PREPARED_DIR),
     "--output-dir", str(RUNS_DIR),
+    "--run-id", RUN_ID,
     "--upload-checkpoints-to-s3",
 ], cwd=str(SOURCE_DIR))
 
