@@ -229,6 +229,12 @@ EXPERIMENT = os.environ.get("PIPELINE_EXPERIMENT", "A_random_split")
 PREPARED_DIR = Path(os.environ.get("PIPELINE_PREPARED_DIR", "/content/outputs/data"))
 RUNS_DIR = Path("/content/outputs/runs")
 
+# LightGBM gradient quantization. The 14-class baseline run showed the training loss going
+# non-monotonic after round 40, swinging between 0.4 and 0.8; "off" is the decisive test of
+# whether quantization is the cause. Each variant trains under its own run id, so switching
+# here never resumes onto an incompatible checkpoint - and never overwrites the other run.
+GRADIENT_QUANTIZATION = "off"  #@param ["as-configured", "off", "bins-32"]
+
 # Pin the run to the preprocessing recipe it was trained on. Without --run-id, train.py
 # resolves the run from active_run.json on S3, which still points at whatever ran last: after
 # a recipe change that resumes onto a checkpoint built from a different feature set and dies
@@ -239,15 +245,22 @@ from data import compute_data_version, load_config
 
 # The experiment tag is part of the id as well as the data_version: two experiments can
 # share a recipe hash only by coincidence, and a collision would silently cross their runs.
-RUN_ID = "lightgbm_{tag}_{version}".format(
-    tag=EXPERIMENT.split("_", 1)[0].lower(),
-    version=compute_data_version(load_config(SOURCE_DIR / DATA_CONFIG)),
+from train import GRADIENT_QUANTIZATION_VARIANTS, run_id_for_variant
+
+RUN_ID = run_id_for_variant(
+    "lightgbm_{tag}_{version}".format(
+        tag=EXPERIMENT.split("_", 1)[0].lower(),
+        version=compute_data_version(load_config(SOURCE_DIR / DATA_CONFIG)),
+    ),
+    GRADIENT_QUANTIZATION_VARIANTS[GRADIENT_QUANTIZATION][1],
 )
 print(f"run_id: {RUN_ID}")
+print(f"gradient quantization: {GRADIENT_QUANTIZATION}")
 
 train_code = subprocess.call([
     sys.executable, "train.py",
     "--config", TRAIN_CONFIG,
+    "--gradient-quantization", GRADIENT_QUANTIZATION,
     "--prepared-data-dir", str(PREPARED_DIR),
     "--output-dir", str(RUNS_DIR),
     "--run-id", RUN_ID,

@@ -45,6 +45,61 @@ from model import (
 LOGGER = logging.getLogger(__name__)
 PAUSED_EXIT_CODE = 75
 
+# Gradient-quantization variants, each with the run-id suffix that keeps its checkpoints
+# apart. Changing these parameters changes params_hash, so without a distinct run id a
+# rerun would resume onto an incompatible checkpoint and stop at the resume guard.
+GRADIENT_QUANTIZATION_VARIANTS: dict[str, tuple[dict[str, Any], str]] = {
+    "as-configured": ({}, ""),
+    "off": ({"use_quantized_grad": False}, "gq-off"),
+    "bins-32": ({"use_quantized_grad": True, "num_grad_quant_bins": 32}, "gq32"),
+}
+
+
+def apply_gradient_quantization(config: dict[str, Any], variant: str) -> str:
+    """Override the quantization parameters in place; return the run-id suffix."""
+    if variant not in GRADIENT_QUANTIZATION_VARIANTS:
+        raise ValueError(
+            f"Unknown --gradient-quantization {variant!r}; expected one of "
+            f"{sorted(GRADIENT_QUANTIZATION_VARIANTS)}"
+        )
+    overrides, suffix = GRADIENT_QUANTIZATION_VARIANTS[variant]
+    if overrides:
+        config["model_params"].update(overrides)
+        validate_training_config(config)
+        LOGGER.info("Gradient quantization variant %r applied: %s", variant, overrides)
+    return suffix
+
+
+def run_id_for_variant(run_id: str | None, suffix: str) -> str | None:
+    if not run_id or not suffix:
+        return run_id
+    return run_id if run_id.endswith(f"_{suffix}") else f"{run_id}_{suffix}"
+
+
+def variant_from_run_id(run_id: str) -> str:
+    """Which quantization variant a run id was created for."""
+    for name, (_, suffix) in GRADIENT_QUANTIZATION_VARIANTS.items():
+        if suffix and run_id.endswith(f"_{suffix}"):
+            return name
+    return "as-configured"
+
+
+def check_variant_matches_run(run_id: str, variant: str) -> None:
+    """Fail with an actionable message rather than an opaque params_hash mismatch.
+
+    The GitHub Actions fallback resolves the run id from S3 rather than being told it, so
+    it can easily be pointed at a run trained under a different quantization setting. The
+    resume guard would catch that, but only as "params_hash differs", which says nothing
+    about which flag to pass.
+    """
+    implied = variant_from_run_id(run_id)
+    if implied != variant:
+        raise ValueError(
+            f"Run {run_id!r} was trained with gradient quantization {implied!r} but this "
+            f"session selected {variant!r}. Pass --gradient-quantization {implied} to "
+            "continue it, or choose a different run id."
+        )
+
 
 def load_train_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
@@ -214,6 +269,7 @@ def _write_run_configuration(
     data_version: str | None,
     memory_estimate: Mapping[str, Any],
     monitor_summary: Mapping[str, Any] | None = None,
+    gradient_quantization: Mapping[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     config_dir = run_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -261,6 +317,7 @@ def _write_run_configuration(
             "open_set_only_splits": manifest["split"].get("open_set_only_splits", []),
         },
         "monitoring": dict(monitor_summary) if monitor_summary else {"enabled": False},
+        "gradient_quantization": dict(gradient_quantization) if gradient_quantization else None,
         "params_hash": params_hash,
         "feature_schema_hash": feature_schema_hash,
         "feature_count": len(feature_names),
@@ -365,6 +422,8 @@ def _run_final_reporting(
 
 def train(args: argparse.Namespace) -> int:
     config = load_train_config(args.config)
+    variant = str(getattr(args, "gradient_quantization", "as-configured"))
+    variant_suffix = apply_gradient_quantization(config, variant)
     if args.prepared_data_dir is not None:
         config["dataset"]["prepared_data_dir"] = args.prepared_data_dir
     if args.max_rounds_this_session is not None:
@@ -388,7 +447,8 @@ def train(args: argparse.Namespace) -> int:
         s3_config=config["s3"],
         s3_enabled_override=True if args.upload_checkpoints_to_s3 else None,
     )
-    run_id = manager.resolve_run_id(args.run_id)
+    run_id = manager.resolve_run_id(run_id_for_variant(args.run_id, variant_suffix))
+    check_variant_matches_run(run_id, variant)
     run_dir = manager.run_dir(run_id)
     prepared = Path(config["dataset"]["prepared_data_dir"])
 
@@ -430,6 +490,14 @@ def train(args: argparse.Namespace) -> int:
             run_dir, config, bundle.params, bundle.params_hash, bundle.feature_schema_hash,
             bundle.label_mapping, bundle.feature_names, bundle.model_feature_names, lgb.__version__,
             bundle.feature_selection, _prepared_data_version(prepared), bundle.memory_estimate,
+            gradient_quantization={
+                "variant": variant,
+                "use_quantized_grad": bool(config["model_params"]["use_quantized_grad"]),
+                "num_grad_quant_bins": (
+                    int(config["model_params"]["num_grad_quant_bins"])
+                    if config["model_params"]["use_quantized_grad"] else None
+                ),
+            },
             monitor_summary={
                 "enabled": bundle.monitor_dataset is not None,
                 "name": bundle.monitor_name,
@@ -578,6 +646,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs/runs")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--max-rounds-this-session", type=int, default=None)
+    parser.add_argument(
+        "--gradient-quantization",
+        choices=sorted(GRADIENT_QUANTIZATION_VARIANTS),
+        default="as-configured",
+        help=(
+            "Override LightGBM gradient quantization. 'off' removes it entirely, which is the "
+            "decisive test for whether it is what makes the training loss non-monotonic. Any "
+            "value but 'as-configured' also extends --run-id, so variants never share a checkpoint."
+        ),
+    )
     parser.add_argument("--upload-checkpoints-to-s3", action="store_true")
     return parser.parse_args()
 

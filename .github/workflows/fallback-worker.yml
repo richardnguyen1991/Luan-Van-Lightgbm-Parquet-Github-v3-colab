@@ -24,6 +24,18 @@ on:
         required: false
         default: ""
         type: string
+      gradient_quantization:
+        description: >
+          Must match the run being continued. A run id ending in _gq-off or _gq32 was
+          trained with that variant; train.py refuses the job otherwise rather than
+          resuming onto an incompatible checkpoint.
+        required: false
+        default: as-configured
+        type: choice
+        options:
+          - as-configured
+          - off
+          - bins-32
 
 permissions:
   contents: read
@@ -125,6 +137,7 @@ jobs:
           set +e
           python train.py \
             --config config/train.gha.json \
+            --gradient-quantization "${{ inputs.gradient_quantization }}" \
             --prepared-data-dir outputs/data \
             --output-dir outputs/runs \
             --run-id "${{ steps.run.outputs.run_id }}" \

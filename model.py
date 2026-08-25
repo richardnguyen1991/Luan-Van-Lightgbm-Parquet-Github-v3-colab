@@ -29,6 +29,11 @@ INTERNAL_COLUMNS = ("_sample_file_id", "_sample_row_id", "_label")
 # Mirrors data.OPEN_SET_LABEL_CODE: rows of a class deliberately withheld from training.
 OPEN_SET_LABEL_CODE = -1
 RESERVED_VALID_NAMES = frozenset({"train", "validation", "training"})
+# LightGBM accepts any positive bin count; these are the powers of two worth testing.
+# 16 is the baseline. Gradient quantization trades a little accuracy for memory, and on
+# this 14-class problem it made the training loss non-monotonic, so the count has to be
+# variable for that to be measurable rather than assumed.
+ALLOWED_GRAD_QUANT_BINS = (4, 8, 16, 32, 64)
 
 
 class TrainingPauseRequested(RuntimeError):
@@ -172,9 +177,6 @@ def validate_training_config(config: Mapping[str, Any]) -> None:
         "deterministic": True,
         "is_enable_sparse": False,
         "histogram_pool_size": 128.0,
-        "use_quantized_grad": True,
-        "num_grad_quant_bins": 16,
-        "quant_train_renew_leaf": True,
     }
     mismatches = {
         key: {"expected": expected, "observed": params.get(key)}
@@ -183,6 +185,22 @@ def validate_training_config(config: Mapping[str, Any]) -> None:
     }
     if mismatches:
         raise ValueError(f"Baseline parameter contract violated: {mismatches}")
+    # Gradient quantization is the one learning parameter allowed to vary, because its
+    # effect is what a run may be trying to measure. Everything it implies is still checked.
+    quantized = params.get("use_quantized_grad")
+    if not isinstance(quantized, bool):
+        raise ValueError("model_params.use_quantized_grad must be a boolean")
+    if quantized:
+        bins = params.get("num_grad_quant_bins")
+        if bins not in ALLOWED_GRAD_QUANT_BINS:
+            raise ValueError(
+                f"model_params.num_grad_quant_bins must be one of {list(ALLOWED_GRAD_QUANT_BINS)}; "
+                f"got {bins!r}"
+            )
+        if params.get("quant_train_renew_leaf") is not True:
+            raise ValueError(
+                "model_params.quant_train_renew_leaf must be true while gradient quantization is on"
+            )
     if bool(params.get("force_col_wise")) == bool(params.get("force_row_wise")):
         raise ValueError("Exactly one of force_col_wise and force_row_wise must be true")
     if int(params.get("num_threads", 0)) <= 0:

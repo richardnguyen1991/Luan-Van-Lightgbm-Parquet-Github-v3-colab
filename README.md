@@ -752,6 +752,49 @@ TFTP một mình chiếm 28.5% corpus, nên accuracy gần như vô nghĩa: đo�
 - Balanced accuracy (= macro recall) được tính **mỗi vòng**, không chỉ ở bảng cuối, nên
   `learning_curves` có panel riêng cho nó.
 
+## Lượng tử hoá gradient và đường loss mất ổn định
+
+Run 14 lớp đầu tiên (`lightgbm_a_1225d5b5f1b142ca`) cho một đường Multi-logloss **không đơn
+điệu**: chạm đáy khoảng 0.38 quanh vòng 40 rồi dao động giữa ~0.4 và ~0.82 suốt sáu mươi vòng
+còn lại. Ba panel kia bão hoà từ vòng ~10 và không cải thiện nữa.
+
+Đây không phải chuyện thẩm mỹ. Hợp đồng cố định **đúng 100 vòng, không early stopping**, nên
+mô hình giao ra là mô hình ở vòng 100 — rơi vào đỉnh hay đáy của dao động là chuyện may rủi,
+và mọi con số phía sau (thí nghiệm B, vòng quét k) đều thừa hưởng sự bất ổn đó.
+
+Nghi phạm là `use_quantized_grad` + `num_grad_quant_bins = 16`. Để đo được thay vì đoán, hai
+tham số này được **tách khỏi** khối `required_exact`; mọi tham số học khác vẫn khoá cứng như
+cũ (test `test_the_rest_of_the_learning_contract_is_still_locked` chốt điều đó).
+
+```bash
+python train.py --config config/train.json --gradient-quantization off \
+                --prepared-data-dir outputs/data --output-dir outputs/runs
+```
+
+| `--gradient-quantization` | model_params | Hậu tố run_id |
+|---|---|---|
+| `as-configured` | như trong file config (mặc định 16 bin) | *(không)* |
+| `off` | `use_quantized_grad = false` | `_gq-off` |
+| `bins-32` | `num_grad_quant_bins = 32` | `_gq32` |
+
+**Mỗi biến thể có `run_id` riêng.** Đổi tham số học làm đổi `params_hash`; nếu dùng chung
+`run_id` thì lần chạy sau sẽ resume lên checkpoint huấn luyện bằng gradient khác và dừng ở
+guard resume. Hậu tố tách chúng ra, nên ba biến thể sống song song trên S3 và so sánh được.
+
+Nếu một session được trỏ vào run của biến thể khác, `check_variant_matches_run` dừng ngay với
+thông báo nêu đúng cờ cần truyền, thay vì để lỗi hiện ra dưới dạng `params_hash` lệch. Điều
+này quan trọng với fallback GitHub Actions, vốn tự phân giải `run_id` từ S3 chứ không được
+truyền vào — workflow `Fallback worker` do đó có thêm input `gradient_quantization` phải khớp.
+
+**Về RAM:** `model.estimate_training_memory` vốn đã tính gradient ở float32
+(5.14 GiB cho 49.3 triệu dòng × 14 lớp), tức là đã giả định trường hợp *không* lượng tử hoá.
+Tắt nó đi không làm tăng đỉnh dự phóng — 20.02 GiB so với ngân sách 40.8 GiB của runtime
+high-RAM.
+
+Trên Colab, ô `GRADIENT_QUANTIZATION` ở cell 4 chọn biến thể; **mặc định là `off`** để lần
+chạy tiếp theo là phép đo tính ổn định. Dữ liệu đã chuẩn bị được dùng lại nguyên vẹn
+(`data_version` không đổi), nên chỉ tốn thời gian huấn luyện chứ không phải tiền xử lý lại.
+
 ## Biểu đồ và metric
 
 13 nhóm hình, mỗi nhóm xuất đồng thời PNG 300 dpi + PDF vector + CSV dữ liệu:
@@ -796,6 +839,8 @@ phải thế, vì không có nhãn đúng nào để đo.
    (Nếu bật lại sàng lọc: `fit_split = "train"` và `ranking_by_gain` phủ hết cột ứng viên,
    chứng minh việc chọn cột không chạm vào validation/test.)
 9. Repo public không chứa `AKIA` hay secret trong `.ipynb`.
+9b. `run_config.json → gradient_quantization` ghi đúng biến thể đã chạy, và `run_id` mang hậu
+    tố tương ứng (`_gq-off`, `_gq32`, hoặc không có).
 10. `preprocessing.json → dropped_columns` chứa cả bốn cột `Unnamed: 0`, `__source_row_id`,
     `__source_file_id`, `__capture_day` với lý do `explicitly excluded by configuration`, và
     `feature_importance_gain` **không** còn cột nào trong số đó.
