@@ -4,6 +4,12 @@
   "explain_max_samples": 50000,
   "shap_chunk_rows": 1000,
   "permutation_repeats": 5,
+  "validation_permutation": {
+    "maximum_rows": 200000,
+    "repeats": 5,
+    "seed": 2026,
+    "predict_chunk_rows": 250000
+  },
   "top_features_to_plot": 30,
   "benchmark": {
     "batch_size": 1024,

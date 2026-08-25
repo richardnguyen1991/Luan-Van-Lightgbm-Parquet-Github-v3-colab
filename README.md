@@ -363,6 +363,89 @@ ngân sách 9,5 GiB — không đủ ở bất kỳ số cột nào. Colab Pro *
 `train.py` thoát 75 ngay trước `claim_run`, nên **không** có `active_run.json` nào được tạo —
 dấu hiệu nhận biết là notebook in "No active run pointer was created in this session".
 
+## Giảm số thuộc tính: xếp hạng trên validation
+
+Câu hỏi "cắt bớt bao nhiêu cột mà không mất độ chính xác" không trả lời được bằng một tập
+đánh giá duy nhất, vì hai cách hỏng nằm ở hai chỗ khác nhau.
+
+**Không dùng test để chọn.** `make_report.py` đã tính permutation importance, nhưng trên
+`raw/explain_sample.parquet` vốn rút từ **test split**. Bảng đó dùng để *giải thích* một mô
+hình đã xong thì tốt; dùng để *chọn* thuộc tính thì hỏng — nó gấp tập giữ lại vào quyết định,
+và mọi con số báo cáo sau đó trên chính tập test ấy đều lạc quan một lượng không đo được.
+
+**Gain cũng không phải selector tốt.** `train_gain_top_k` fit trên train split (sạch), nhưng
+gain thiên vị cột có nhiều giá trị phân biệt, và với các nhóm tương quan mạnh của
+CIC-DDoS2019 (`Fwd Packet Length Max/Min/Mean/Std`, `Flow IAT Mean/Std/Max/Min`) nó chia đều
+công trạng khiến cả nhóm rơi xuống giữa bảng.
+
+`feature_ranking.py` bù đúng mắt xích còn thiếu: permutation importance **đo trên validation**.
+
+```bash
+python feature_ranking.py --run-dir outputs/runs/<run_id> --prepared-data-dir outputs/data
+```
+
+Nó nạp Booster vòng 100, lấy mẫu phân tầng theo lớp từ validation (mặc định 200,000 dòng,
+tối thiểu một dòng mỗi lớp, xác định theo seed), đo Macro-F1 và balanced accuracy gốc, rồi với
+từng cột: hoán vị ngẫu nhiên cột đó `repeats` lần, dự đoán lại, ghi mức sụt. Kết quả:
+
+| Artifact | Nội dung |
+|---|---|
+| `explainability/permutation_importance_validation.csv` | mức sụt trung bình + độ lệch chuẩn của từng cột |
+| `config/feature_ranking_validation.json` | bảng xếp hạng gọn kèm xuất xứ, để bộ chọn tiêu thụ |
+
+Cột `within_noise` đánh dấu những thuộc tính có mức sụt **không lớn hơn độ lệch chuẩn của
+chính phép đo** — tức là không có bằng chứng chúng hữu ích. Nó chỉ đánh dấu chứ không tự cắt:
+ngưỡng cắt là quyết định của người làm thí nghiệm, không phải của bảng xếp hạng.
+
+### Dùng bảng xếp hạng để train lại
+
+```json
+"feature_selection": "validation_permutation_top_k",
+"dataset": {
+  "feature_screening": {
+    "maximum_features": 30,
+    "ranking_file": "outputs/runs/<run_id>/config/feature_ranking_validation.json"
+  }
+}
+```
+
+Bộ chọn **từ chối** một file xếp hạng không được đo trên validation (`scored_split != "validation"`),
+và từ chối một file không phủ đúng tập cột ứng viên — đó là dấu hiệu nó đến từ một công thức
+tiền xử lý khác. `feature_selection.json` của run rút gọn ghi `fit_split: "validation"` cùng
+`run_id` và `feature_schema_hash` của run đã sinh ra bảng xếp hạng, nên chuỗi quyết định truy
+vết được đầy đủ.
+
+### Quy trình đề xuất cho luận văn
+
+| Bước | Tập dữ liệu | Việc |
+|---|---|---|
+| 1 | **A**, train | Chạy đủ 79 thuộc tính, lấy `feature_ranking_validation.json` |
+| 2 | **A**, validation | Quét `maximum_features` ∈ {60, 40, 30, 20, 15, 10}, chọn k |
+| 3 | **B**, test (một lần) | Xác nhận k trên ngày giữ lại so với baseline 79 cột của B |
+| 4 | **C** (tuỳ chọn) | So `mean_predictive_entropy` giữa hai tập cột |
+
+Ba điều quyết định quy trình này:
+
+- **A một mình không kết luận được.** Khoảng cách train–validation của A ở vòng 100 là 0.0076
+  logloss, nhỏ hơn một sai số chuẩn. Validation của A không phân biệt được giữa "tập cột rút
+  gọn thật sự đủ" và "vẫn nội suy được vì các luồng gần trùng nằm ở cả hai phía".
+- **B một mình không chọn được.** Nó chỉ có 6/14 lớp; một cột chỉ thiết yếu cho NTP sẽ bị coi
+  là vô dụng mà không có cách nào biết. Đây là giới hạn của bộ dữ liệu, cần nêu thành
+  *limitation*.
+- **Chỉ xác nhận trên B đúng một lần.** Quét k trên test của B sẽ biến nó thành một tập
+  validation thứ hai và bạn quay lại đúng vấn đề của A.
+
+Bước 2 chạy đủ quy mô sẽ tốn ~2 giờ mỗi giá trị k. Rẻ hơn: đặt `dataset.target_total_rows`
+khoảng 7 triệu (10%) cho vòng quét, chốt k, rồi mới chạy full-scale hai cấu hình (79 và k).
+
+**Đặt ngưỡng dung sai trước, đừng dùng kiểm định ý nghĩa.** Với 10.5 triệu dòng validation,
+mọi chênh lệch đều "có ý nghĩa thống kê" kể cả khi vô nghĩa thực tế. Hãy tuyên bố trước, ví
+dụ: *chấp nhận nếu Macro-F1 giảm ≤ 0.005 tuyệt đối và không lớp nào mất quá 0.02 recall*.
+
+Cấu hình phép đo nằm ở `config/report.json → validation_permutation`
+(`maximum_rows`, `repeats`, `seed`, `predict_chunk_rows`). Chi phí xấp xỉ
+`features × repeats` lượt dự đoán: 79 × 5 = 395 lượt trên `maximum_rows` dòng.
+
 ## Watchdog và fallback
 
 `.github/workflows/watchdog.yml` chạy mỗi 30 phút, đọc `active_run.json` trên S3 và chọn một
@@ -451,6 +534,9 @@ python train.py --config config/train.smoke.json --prepared-data-dir outputs/dat
                 --output-dir outputs/runs-smoke                                 # tiếp vòng 21
 
 python make_report.py --run-dir outputs/runs-smoke/<run_id> --no-upload-to-s3
+
+python feature_ranking.py --run-dir outputs/runs-smoke/<run_id> \
+                          --prepared-data-dir outputs/data-smoke
 ```
 
 Ba thí nghiệm trên dữ liệu đầy đủ, chạy cục bộ:
@@ -688,6 +774,10 @@ phải thế, vì không có nhãn đúng nào để đo.
 13. Ở thí nghiệm C: `test_metrics.json → evaluation_mode = "open_set"`, không có khoá
     `accuracy`, và `open_set_prediction_distribution.csv` phủ đủ 13 lớp đã huấn luyện.
 14. `history.json` có `train_macro_recall` và `val_macro_recall` ở mọi vòng.
+15. Nếu dùng `validation_permutation_top_k`: `feature_selection.json` có
+    `fit_split = "validation"`, `ranking_run_id` trỏ đúng run đã sinh bảng xếp hạng, và
+    `selected_feature_count == maximum_features`. Bảng xếp hạng phải đến từ
+    `feature_ranking.py` — không có đường nào nạp được một bảng đo trên test.
 
 ## Kiểm tra quyền S3 trước khi train
 

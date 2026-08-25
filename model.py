@@ -125,8 +125,8 @@ def validate_training_config(config: Mapping[str, Any]) -> None:
         raise ValueError("The baseline must run on CPU")
     if config["imbalance_handling"] != "none":
         raise ValueError("Training imbalance handling must be 'none'")
-    if config["feature_selection"] not in {"none", "train_gain_top_k"}:
-        raise ValueError("feature_selection must be 'none' or 'train_gain_top_k'")
+    if config["feature_selection"] not in SUPPORTED_FEATURE_SELECTION:
+        raise ValueError(f"feature_selection must be one of {list(SUPPORTED_FEATURE_SELECTION)}")
     if config["feature_selection"] == "train_gain_top_k":
         screening = config.get("dataset", {}).get("feature_screening")
         if not isinstance(screening, Mapping):
@@ -138,6 +138,19 @@ def validate_training_config(config: Mapping[str, Any]) -> None:
             raise ValueError("dataset.feature_screening.learning_rate must be positive")
         if not isinstance(screening.get("seed"), int):
             raise ValueError("dataset.feature_screening.seed must be an integer")
+    if config["feature_selection"] == "validation_permutation_top_k":
+        screening = config.get("dataset", {}).get("feature_screening")
+        if not isinstance(screening, Mapping):
+            raise ValueError(
+                "dataset.feature_screening is required for validation_permutation_top_k"
+            )
+        if int(screening.get("maximum_features", 0)) <= 0:
+            raise ValueError("dataset.feature_screening.maximum_features must be positive")
+        if not str(screening.get("ranking_file", "")).strip():
+            raise ValueError(
+                "dataset.feature_screening.ranking_file must name the feature_ranking_validation"
+                ".json produced by feature_ranking.py against a completed full-feature run"
+            )
     if not bool(config["use_all_train_rows"]):
         raise ValueError("The baseline must use every row in the train split")
     params = config["model_params"]
@@ -658,6 +671,82 @@ def _read_split_labels(prepared_dir: Path, parts: Sequence[Mapping[str, Any]]) -
     return labels
 
 
+SUPPORTED_FEATURE_SELECTION = ("none", "train_gain_top_k", "validation_permutation_top_k")
+
+
+def _select_by_validation_permutation(
+    candidates: Sequence[str], config: Mapping[str, Any]
+) -> tuple[list[str], dict[str, Any]]:
+    """Take the top k of a permutation ranking a previous run measured on validation.
+
+    Gain, the other available ranking, is fitted on the training split and rewards
+    high-cardinality columns; permutation measures what a trained model actually loses
+    when a column is destroyed. It needs a trained model to exist first, so the ranking is
+    produced by ``feature_ranking.py`` against a completed full-feature run and consumed
+    here by the reduced-feature run that follows.
+
+    The ranking file is refused unless it was scored on validation. Selecting on a
+    test-derived ranking would fold the held-out split into the decision and quietly
+    inflate every number reported on it afterwards.
+    """
+    # Imported lazily: feature_ranking imports this module.
+    from feature_ranking import load_ranking
+
+    settings = dict(config["dataset"].get("feature_screening") or {})
+    ranking_file = settings.get("ranking_file")
+    if not ranking_file:
+        raise ValueError(
+            "feature_selection='validation_permutation_top_k' requires "
+            "dataset.feature_screening.ranking_file"
+        )
+    maximum_features = int(settings["maximum_features"])
+    candidates = list(candidates)
+    if not 1 <= maximum_features <= len(candidates):
+        raise ValueError("feature_screening.maximum_features is outside the candidate feature range")
+
+    payload = load_ranking(ranking_file)
+    ranked = [str(item["feature"]) for item in payload["ranking"]]
+    missing = [name for name in candidates if name not in set(ranked)]
+    if missing:
+        raise ValueError(
+            "The feature ranking does not cover every candidate column, so a top-k cut would "
+            f"be arbitrary. Missing: {missing[:10]}"
+        )
+    unknown = [name for name in ranked if name not in set(candidates)]
+    if unknown:
+        raise ValueError(
+            "The feature ranking names columns this dataset does not have; it was produced "
+            f"from a different preprocessing recipe. Unexpected: {unknown[:10]}"
+        )
+    chosen = set(ranked[:maximum_features])
+    selected = [name for name in candidates if name in chosen]
+    if len(selected) != maximum_features:
+        raise AssertionError("Top-k selection did not preserve the requested feature count")
+    LOGGER.info(
+        "Selected %d/%d features from the validation permutation ranking of run %s",
+        len(selected), len(candidates), payload.get("run_id"),
+    )
+    return selected, {
+        "method": "validation_permutation_top_k",
+        # The ranking never saw train or test: it is measured on validation only.
+        "fit_split": payload["scored_split"],
+        "ranking_file": str(ranking_file),
+        "ranking_run_id": payload.get("run_id"),
+        "ranking_feature_schema_hash": payload.get("feature_schema_hash"),
+        "ranking_scored_by": payload.get("scored_by"),
+        "ranking_rows_scored": payload.get("split_rows_scored"),
+        "ranking_repeats": payload.get("repeats"),
+        "ranking_seed": payload.get("seed"),
+        "ranking_baseline_macro_f1": payload.get("baseline_macro_f1"),
+        "features_within_measurement_noise": payload.get("features_within_noise"),
+        "candidate_feature_count": len(candidates),
+        "selected_feature_count": len(selected),
+        "selected_features_in_model_order": selected,
+        "ranking_by_permutation": payload["ranking"],
+        "final_training_rows_discarded": 0,
+    }
+
+
 def select_model_features(
     lgb: Any,
     prepared: Path,
@@ -676,6 +765,8 @@ def select_model_features(
             "selected_feature_count": len(candidates),
             "selected_features_in_model_order": candidates,
         }
+    if method == "validation_permutation_top_k":
+        return _select_by_validation_permutation(candidates, config)
     if method != "train_gain_top_k":
         raise ValueError(f"Unsupported feature selection method: {method}")
 

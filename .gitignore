@@ -7,3 +7,5 @@ outputs/
 kaggle.json
 *.pem
 s3_presigned_config.json
+# Word lock files, created whenever a .docx in this repo is open
+~$*
