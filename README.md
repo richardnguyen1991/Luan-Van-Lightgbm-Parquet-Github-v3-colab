@@ -116,7 +116,8 @@ notebook đã commit.
 
 Notebook làm đúng 5 việc: clone repo (in ra commit SHA để truy vết), nạp secret, chuẩn bị
 hoặc tải dữ liệu, huấn luyện, rồi hiển thị learning curves + confusion matrix +
-`summary_metrics.csv` ngay trong notebook.
+`summary_metrics.csv` ngay trong notebook. Cell 6 là tuỳ chọn và mặc định tắt: nó quét số
+thuộc tính (xem *Giảm số thuộc tính: xếp hạng trên validation*).
 
 **Chọn thí nghiệm ở cell 3.** Ô `EXPERIMENT` có ba giá trị — `A_random_split`,
 `B_cross_capture_day`, `C_open_set` (xem *Ba thí nghiệm*). Mỗi lựa chọn dùng một cặp config
@@ -424,6 +425,36 @@ vết được đầy đủ.
 | 3 | **B**, test (một lần) | Xác nhận k trên ngày giữ lại so với baseline 79 cột của B |
 | 4 | **C** (tuỳ chọn) | So `mean_predictive_entropy` giữa hai tập cột |
 
+Bước 1 và 2 gói trong một lệnh — `scripts/sweep_feature_count.py` tự chuẩn bị mẫu con, chạy
+baseline, sinh bảng xếp hạng, rồi train một mô hình cho mỗi k:
+
+```bash
+python scripts/sweep_feature_count.py \
+    --data-config config/data.json --train-config config/train.json \
+    --output-root outputs/sweep --target-total-rows 7000000 \
+    --k 60 40 30 20 15 10 \
+    --tolerance-macro-f1 0.005 --tolerance-class-recall 0.02
+```
+
+Trên Colab, cell 6 gọi đúng lệnh này (mặc định tắt, bật bằng ô `RUN_SWEEP`).
+
+Kết quả nằm ở `sweep_feature_count.csv` và `sweep_feature_count.json`. `chosen_k` là **k nhỏ
+nhất** thoả cả hai ngưỡng; nếu không k nào thoả thì nó là `null` — một kết quả hợp lệ, nghĩa
+là ở quy mô này không cắt được cột nào mà không trả giá.
+
+Ba tính chất của bộ điều khiển:
+
+- **Mọi so sánh đo trên validation.** `val_macro_f1` và `val_balanced_accuracy` lấy từ dòng
+  cuối `history.json` (LightGBM đã tính trên toàn bộ validation mỗi vòng); recall từng lớp lấy
+  từ `feature_ranking.validation_scores`. Không chỗ nào đọc `summary_metrics.csv`, vốn tính
+  trên **test** — đọc nó là chọn k bằng chính tập giữ lại. Phép kiểm
+  `test_the_sweep_never_reads_the_test_metrics` khoá tính chất này bằng cách chứng minh hai
+  con số đó khác nhau.
+- **Ngưỡng khai báo trước khi chạy**, truyền qua tham số dòng lệnh chứ không chọn sau khi
+  nhìn kết quả.
+- **Tiếp tục được.** Run nào đã đủ 100 vòng thì bỏ qua, nên session Colab chết giữa chừng chỉ
+  cần chạy lại cell.
+
 Ba điều quyết định quy trình này:
 
 - **A một mình không kết luận được.** Khoảng cách train–validation của A ở vòng 100 là 0.0076
@@ -537,6 +568,10 @@ python make_report.py --run-dir outputs/runs-smoke/<run_id> --no-upload-to-s3
 
 python feature_ranking.py --run-dir outputs/runs-smoke/<run_id> \
                           --prepared-data-dir outputs/data-smoke
+
+python scripts/sweep_feature_count.py --data-config config/data.smoke.json \
+    --train-config config/train.smoke.json --output-root outputs/sweep-smoke \
+    --target-total-rows 20000 --k 40 20 10
 ```
 
 Ba thí nghiệm trên dữ liệu đầy đủ, chạy cục bộ:

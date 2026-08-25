@@ -304,6 +304,61 @@ else:
 '''
 
 
+SWEEP = '''#@title 6. (optional) Choose how many features to keep - sweep k on validation
+# Step 2 of the feature-reduction protocol. Independent of cells 4 and 5: it prepares its
+# own deterministic subsample and trains one model per candidate k on it, so it neither
+# reads nor disturbs the main run.
+#
+# Every comparison is made on the validation split. summary_metrics.csv is computed on
+# test, so picking k from it would decide the reduction with the held-out set.
+import os, subprocess, sys
+from pathlib import Path
+
+SOURCE_DIR = Path("/content/src")
+RUN_SWEEP = False  #@param {type:"boolean"}
+TARGET_TOTAL_ROWS = 7000000  #@param {type:"integer"}
+CANDIDATE_K = "60 40 30 20 15 10"  #@param {type:"string"}
+TOLERANCE_MACRO_F1 = 0.005  #@param {type:"number"}
+TOLERANCE_CLASS_RECALL = 0.02  #@param {type:"number"}
+
+DATA_CONFIG = os.environ.get("PIPELINE_DATA_CONFIG", "config/data.json")
+TRAIN_CONFIG = os.environ.get("PIPELINE_TRAIN_CONFIG", "config/train.json")
+EXPERIMENT = os.environ.get("PIPELINE_EXPERIMENT", "A_random_split")
+
+if not RUN_SWEEP:
+    print("RUN_SWEEP is off. Tick it to sweep k; expect roughly 15-20 minutes per value.")
+elif EXPERIMENT != "A_random_split":
+    raise SystemExit(
+        "Sweep k on Experiment A, which carries all 14 classes. Experiment B has 6 of them, "
+        "so a column that matters only to NTP would be dropped there without a trace. "
+        "Confirm the chosen k on B afterwards, once."
+    )
+else:
+    code = subprocess.call([
+        sys.executable, "scripts/sweep_feature_count.py",
+        "--data-config", DATA_CONFIG,
+        "--train-config", TRAIN_CONFIG,
+        "--output-root", "/content/outputs/sweep",
+        "--target-total-rows", str(TARGET_TOTAL_ROWS),
+        "--tolerance-macro-f1", str(TOLERANCE_MACRO_F1),
+        "--tolerance-class-recall", str(TOLERANCE_CLASS_RECALL),
+        "--k", *CANDIDATE_K.split(),
+    ], cwd=str(SOURCE_DIR))
+    if code != 0:
+        raise SystemExit(f"sweep exited {code}; rerun this cell to continue where it stopped")
+    import json
+    import pandas as pd
+    decision = json.loads(
+        Path("/content/outputs/sweep/sweep_feature_count.json").read_text(encoding="utf-8")
+    )
+    display(pd.read_csv("/content/outputs/sweep/sweep_feature_count.csv")[[
+        "k", "val_macro_f1", "delta_macro_f1", "val_balanced_accuracy",
+        "worst_class", "worst_class_recall_drop", "accepted",
+    ]])
+    print("chosen k:", decision["chosen_k"])
+    print("next:", decision["next_step"])
+'''
+
 def code_cell(source: str) -> dict:
     return {
         "cell_type": "code",
@@ -331,6 +386,7 @@ def build_notebook() -> dict:
             code_cell(DATA),
             code_cell(TRAIN),
             code_cell(SUMMARY),
+            code_cell(SWEEP),
         ],
         "metadata": {
             "accelerator": "None",

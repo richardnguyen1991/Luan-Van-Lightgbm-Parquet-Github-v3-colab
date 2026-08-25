@@ -98,17 +98,13 @@ def _predict_classes(booster: Any, frame: pd.DataFrame, chunk_rows: int) -> np.n
     return predicted
 
 
-def validation_permutation_importance(
-    run_dir: str | Path,
-    prepared_data_dir: str | Path,
-    settings: Mapping[str, Any] | None = None,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Mean drop in Macro-F1 when each feature is destroyed, measured on validation."""
-    import lightgbm as lgb
+def _load_validation_context(run_dir: Path, prepared: Path) -> dict[str, Any]:
+    """Booster plus the validation split it will be scored on, and nothing else.
 
-    run_dir = Path(run_dir)
-    prepared = Path(prepared_data_dir)
-    settings = dict(settings or load_settings(run_dir))
+    Reading the split by name here rather than taking it as an argument is deliberate:
+    every consumer in this module must be structurally incapable of scoring on test.
+    """
+    import lightgbm as lgb
 
     manifest = json.loads((prepared / "sample_manifest.json").read_text(encoding="utf-8"))
     label_mapping = json.loads((prepared / "label_mapping.json").read_text(encoding="utf-8"))
@@ -118,20 +114,104 @@ def validation_permutation_importance(
 
     booster = lgb.Booster(model_file=str(run_dir / "checkpoints" / "final_model_round_100.txt"))
     if int(booster.current_iteration()) != 100:
-        raise ValueError("Feature ranking requires the round-100 Booster")
+        raise ValueError("Scoring requires the round-100 Booster")
     if list(booster.feature_name()) != model_feature_names:
         raise ValueError("Booster feature order disagrees with run_config.json")
 
     parts = manifest["parts"][PERMUTATION_SPLIT]
-    labels_all = _read_split_labels(prepared, parts)
-    if np.any(labels_all < 0):
+    labels = _read_split_labels(prepared, parts)
+    if np.any(labels < 0):
         raise ValueError(
             "The validation split contains open-set rows, which have no trainable label to "
-            "score a permutation against"
+            "score against"
         )
-    features_all = LazyParquetFeatures(prepared, parts, feature_names, model_feature_names)
-    if len(features_all) != len(labels_all):
+    features = LazyParquetFeatures(prepared, parts, feature_names, model_feature_names)
+    if len(features) != len(labels):
         raise AssertionError("Validation feature and label counts disagree")
+    return {
+        "booster": booster,
+        "features": features,
+        "labels": labels,
+        "feature_names": feature_names,
+        "model_feature_names": model_feature_names,
+        "label_mapping": label_mapping,
+        "run_config": run_config,
+    }
+
+
+def validation_scores(
+    run_dir: str | Path,
+    prepared_data_dir: str | Path,
+    maximum_rows: int = 0,
+    seed: int = 2026,
+    predict_chunk_rows: int = 250000,
+) -> dict[str, Any]:
+    """Macro-F1, balanced accuracy and per-class recall of a finished run, on validation.
+
+    A feature-count sweep must compare candidates on validation. ``summary_metrics.csv``
+    is computed on the **test** split, so reading it to pick k would decide the reduction
+    using the held-out set and make every later number on that set optimistic. These
+    figures come from the same model but never touch test.
+
+    ``maximum_rows = 0`` scores the whole split, which is what a decision should use; the
+    permutation pass subsamples only because it re-predicts hundreds of times.
+    """
+    run_dir = Path(run_dir)
+    context = _load_validation_context(run_dir, Path(prepared_data_dir))
+    labels_all = context["labels"]
+    indices = (
+        np.arange(len(labels_all), dtype=np.int64)
+        if maximum_rows <= 0 or len(labels_all) <= maximum_rows
+        else stratified_monitor_indices(labels_all, int(maximum_rows), int(seed))
+    )
+    frame = context["features"].read(indices, as_frame=True)
+    labels = labels_all[indices]
+    label_mapping = context["label_mapping"]
+    labels_order = list(range(len(label_mapping)))
+    class_names = [
+        name for name, _ in sorted(label_mapping.items(), key=lambda item: int(item[1]))
+    ]
+    predicted = _predict_classes(context["booster"], frame, int(predict_chunk_rows))
+    macro_f1, balanced_accuracy = _scores(labels, predicted, labels_order)
+    per_class = recall_score(
+        labels, predicted, labels=labels_order, average=None, zero_division=0
+    )
+    support = np.bincount(labels, minlength=len(labels_order))
+    del frame, context
+    gc.collect()
+    return {
+        "scored_split": PERMUTATION_SPLIT,
+        "rows_available": int(len(labels_all)),
+        "rows_scored": int(len(labels)),
+        "macro_f1": macro_f1,
+        "balanced_accuracy": balanced_accuracy,
+        "per_class_recall": {
+            name: float(value) for name, value in zip(class_names, per_class)
+        },
+        "per_class_support": {
+            name: int(value) for name, value in zip(class_names, support)
+        },
+    }
+
+
+def validation_permutation_importance(
+    run_dir: str | Path,
+    prepared_data_dir: str | Path,
+    settings: Mapping[str, Any] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Mean drop in Macro-F1 when each feature is destroyed, measured on validation."""
+    run_dir = Path(run_dir)
+    prepared = Path(prepared_data_dir)
+    settings = dict(settings or load_settings(run_dir))
+
+    context = _load_validation_context(run_dir, prepared)
+    booster = context["booster"]
+    features_all = context["features"]
+    labels_all = context["labels"]
+    feature_names = context["feature_names"]
+    model_feature_names = context["model_feature_names"]
+    label_mapping = context["label_mapping"]
+    run_config = context["run_config"]
 
     indices = stratified_monitor_indices(
         labels_all, int(settings["maximum_rows"]), int(settings["seed"])
